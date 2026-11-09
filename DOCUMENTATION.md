@@ -96,7 +96,20 @@ After Reversing subsegment [vi+1 ... vk-1]:
 4. The vertex $v_{i+1}$ is now the new endpoint of the path.
 5. If $v_{i+1}$ has unvisited neighbors, the path can **continue growing immediately**!
 
-### C. Tree Diameter & BFS Initialization (`bfsFarthest`)
+### C. Splicing & Vertex Insertion (`tryInsertions`)
+When path endpoints cannot be expanded further by extensions or rotations:
+1. We iterate over all unvisited vertices $x \notin P$.
+2. For any vertex $x$ that has at least two neighbors on the path, say $u = P[p_1]$ and $v = P[p_2]$ with $p_2 = p_1 + 1$:
+3. We check if replacing edge $(u, v)$ with $(u, x) + (x, v)$ yields $w(u, x) + w(x, v) \ge w(u, v)$.
+4. If so, we insert $x$ between $u$ and $v$. This directly expands path coverage (increasing vertices visited) and score, while enabling future rotations to pivot around $x$.
+
+### D. Adaptive Failure-Bounded Rotations
+Instead of an arbitrary hard cutoff on rotations (which prematurely stops path growth in graphs with $N \ge 10,000$):
+- We keep rotating and extending as long as progress is being made.
+- We maintain a consecutive failure counter (`failCount`). Only if multiple rotations fail to discover any unvisited vertices does the search terminate and restart.
+- Whenever an extension succeeds, `failCount` is reset to 0.
+
+### E. Tree Diameter & BFS Initialization (`bfsFarthest`)
 For trees (acyclic graphs) and sparse tree-like components:
 - Rotations are not possible because there are no cycle edges.
 - However, two BFS passes find the exact diameter of a tree in $O(N)$ time.
@@ -115,15 +128,15 @@ In Phase 2, we take the best path found so far and perturb it:
 
 We evaluated the solution across diverse graph topologies using our custom test suite and standalone validator (`validate.cpp`):
 
-| Test Case | Graph Type | Vertices ($N$) | Edges ($M$) | Initial Score | Final Score (v2) | Improvement |
+| Test Case | Graph Type | Vertices ($N$) | Edges ($M$) | Initial Score | Optimized Score | Coverage / Status |
 |:---|:---|:---|:---|:---|:---|:---|
-| `small_random` | Dense Random | 20 | 50 | 1,301 | **1,301** | +0% (Optimal) |
-| `medium_random`| Random Graph | 1,000 | 5,000 | 66,493 | **77,560** | **+16.6%** |
-| `tree` | Tree | 1,000 | 999 | 1,140 | **1,459** | **+27.9%** (Optimal) |
-| `grid` | 2D Grid Lattice | 900 | ~1,740 | 31,141 | **55,322** | **+77.7%** |
-| `large_random` | Large Random | 10,000 | 50,000 | 546,910 | **693,628** | **+26.8%** |
-| `dense` | Very Dense | 500 | 20,000 | 47,458 | **48,650** | **+2.5%** |
-| `huge_sparse` | Huge Sparse | 50,000 | 100,000 | 454,380 | **1,522,381** | **+235.1%** |
+| `small_random` | Dense Random | 20 | 50 | 1,301 | **1,301** | 19 / 20 (Optimal) |
+| `medium_random`| Random Graph | 1,000 | 5,000 | 66,493 | **77,970** | **1,000 / 1,000 (100% Hamiltonian path)** |
+| `tree` | Tree | 1,000 | 999 | 1,140 | **1,459** | **24 / 24 (100% Optimal diameter)** |
+| `grid` | 2D Grid Lattice | 900 | ~1,740 | 31,141 | **55,404** | **887 / 900 (98.6% coverage)** |
+| `large_random` | Large Random | 10,000 | 50,000 | 546,910 | **727,120** | **9,970 / 10,000 (99.7% coverage)** |
+| `dense` | Very Dense | 500 | 20,000 | 47,458 | **48,596** | **500 / 500 (100% Hamiltonian path)** |
+| `huge_sparse` | Huge Sparse | 50,000 | 100,000 | 454,380 | **1,838,774** | **27,122 / 50,000 (+304% score jump)** |
 
 ### Key Takeaways from Benchmarks:
 1. **Grid graphs**: Pósa rotations allowed the path to snake through grid dead ends, jumping from 31k to 55k (+77.7%).

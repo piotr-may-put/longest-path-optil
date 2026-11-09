@@ -116,15 +116,14 @@ bool extendEnd(PathState& state, bool randomize) {
 }
 
 // Extend from back, reverse, and extend from new back (both ends)
-void extendBothEnds(PathState& state, bool randomize) {
-    extendEnd(state, randomize);
+bool extendBothEnds(PathState& state, bool randomize) {
+    bool e1 = extendEnd(state, randomize);
     state.reversePath();
-    extendEnd(state, randomize);
+    bool e2 = extendEnd(state, randomize);
+    return e1 || e2;
 }
 
-// Pósa endpoint rotation:
-// If endpoint u = path.back() is connected to path[i] on the path,
-// we reverse subsegment [i+1, k-1]. The old path[i+1] becomes the new endpoint!
+// Try rotation: first seeks an unvisited neighbor; falls back to exploratory rotation
 bool tryRotation(PathState& state) {
     int k = (int)state.path.size();
     if (k < 4) return false;
@@ -134,6 +133,7 @@ bool tryRotation(PathState& state) {
     int bestI = -1;
     int bestGain = -1e9;
     int bestNewW = 0, bestOldW = 0;
+    bool foundFree = false;
 
     for (int idx = adjStart[u]; idx < adjStart[u + 1]; idx++) {
         int vi = adjTo[idx];
@@ -145,7 +145,7 @@ bool tryRotation(PathState& state) {
         int newW = adjW[idx];
         int gain = newW - oldW;
 
-        // Check if the new endpoint would have unvisited neighbors
+        // Check if vi_next has unvisited neighbors
         bool hasFreeNeighbor = false;
         for (int j = adjStart[vi_next]; j < adjStart[vi_next + 1]; j++) {
             if (state.pos[adjTo[j]] == -1) {
@@ -155,14 +155,14 @@ bool tryRotation(PathState& state) {
         }
 
         if (hasFreeNeighbor) {
-            // Prioritize rotations that unlock new vertices
+            foundFree = true;
             if (gain + 1000 > bestGain) {
                 bestGain = gain + 1000;
                 bestI = i;
                 bestNewW = newW;
                 bestOldW = oldW;
             }
-        } else if (gain > bestGain && gain >= 0) {
+        } else if (!foundFree && gain > bestGain && gain >= -15) {
             bestGain = gain;
             bestI = i;
             bestNewW = newW;
@@ -179,22 +179,79 @@ bool tryRotation(PathState& state) {
     return false;
 }
 
+// Splicing: Try inserting unvisited vertices between consecutive path vertices
+int tryInsertions(PathState& state) {
+    int insertedCount = 0;
+    int k = (int)state.path.size();
+    if (k >= N) return 0;
+
+    for (int x = 0; x < N; x++) {
+        if (state.pos[x] != -1) continue;
+
+        // Check if x has at least 2 neighbors on the path
+        vector<pair<int,int>> pathNbrs;
+        for (int i = adjStart[x]; i < adjStart[x + 1]; i++) {
+            int v = adjTo[i];
+            if (state.pos[v] != -1) {
+                pathNbrs.push_back({state.pos[v], adjW[i]});
+            }
+        }
+
+        if (pathNbrs.size() < 2) continue;
+        sort(pathNbrs.begin(), pathNbrs.end());
+
+        for (int j = 0; j + 1 < (int)pathNbrs.size(); j++) {
+            int p1 = pathNbrs[j].first;
+            int p2 = pathNbrs[j + 1].first;
+            if (p2 - p1 != 1) continue;
+
+            int u = state.path[p1];
+            int v = state.path[p2];
+            int oldW = getEdgeWeight(u, v);
+            int newW = pathNbrs[j].second + pathNbrs[j + 1].second;
+
+            if (newW >= oldW) {
+                state.path.insert(state.path.begin() + p2, x);
+                state.score += (newW - oldW);
+                for (int idx = p2; idx < (int)state.path.size(); idx++) {
+                    state.pos[state.path[idx]] = idx;
+                }
+                insertedCount++;
+                break;
+            }
+        }
+    }
+    return insertedCount;
+}
+
 // Build a path from startNode using extensions and rotations
 void searchPath(int startNode, PathState& state) {
     state.init(startNode);
     extendBothEnds(state, true);
 
-    int maxRotations = 60;
-    for (int r = 0; r < maxRotations; r++) {
+    int failCount = 0;
+    int maxFails = min(150, max(30, N / 200));
+
+    while (failCount < maxFails) {
         bool rotated = tryRotation(state);
         if (!rotated) {
             state.reversePath();
             rotated = tryRotation(state);
         }
-        if (!rotated) break;
+        if (!rotated) {
+            failCount += 5;
+            continue;
+        }
 
-        extendBothEnds(state, false);
+        bool ext = extendBothEnds(state, false);
+        if (ext) {
+            failCount = 0; // reset because path grew
+        } else {
+            failCount++;
+        }
     }
+
+    tryInsertions(state);
 
     if (state.score > bestScore) {
         bestScore = state.score;
@@ -224,13 +281,23 @@ void perturbPath(PathState& state) {
 
     extendBothEnds(state, true);
 
-    for (int r = 0; r < 30; r++) {
-        if (!tryRotation(state)) {
+    int failCount = 0;
+    int maxFails = min(100, max(20, N / 300));
+
+    while (failCount < maxFails) {
+        bool rotated = tryRotation(state);
+        if (!rotated) {
             state.reversePath();
-            if (!tryRotation(state)) break;
+            rotated = tryRotation(state);
         }
-        extendBothEnds(state, false);
+        if (!rotated) { failCount += 5; continue; }
+
+        bool ext = extendBothEnds(state, false);
+        if (ext) failCount = 0;
+        else failCount++;
     }
+
+    tryInsertions(state);
 
     if (state.score > bestScore) {
         bestScore = state.score;
