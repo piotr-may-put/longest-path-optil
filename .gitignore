@@ -1,0 +1,22 @@
+# Compiled binaries
+*.exe
+*.o
+*.obj
+*.pdb
+*.ilk
+
+# Test inputs and outputs
+tests/
+results/
+*.txt
+
+# IDE and Editor directories
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS generated files
+Thumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
