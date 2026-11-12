@@ -5,10 +5,8 @@
 *.pdb
 *.ilk
 
-# Test inputs and outputs
-tests/
+# Test outputs
 results/
-*.txt
 
 # IDE and Editor directories
 .vscode/
