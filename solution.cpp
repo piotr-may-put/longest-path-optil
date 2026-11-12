@@ -6,18 +6,18 @@
 #include <vector>
 using namespace std;
 
-const double TIME_LIMIT = 25.0;
+const double TIME_LIMIT = 29.0;
 const int BUILD_TRIES = 100;
 const int KICK_TRIES = 20;
 
 int n, m;
-int minDirtyIdx; // Najmniejszy indeks, od którego ścieżka uległa zmianie
+int minDirtyIdx; 
 long long curWeight;
 
 vector<vector<pair<int, int>>> adj;
 vector<int> path;
-vector<int> pos;       // Pozycja wierzchołka w ścieżce (-1 jeśli poza ścieżką)
-vector<int> edgeToNext; // Tablica pomocnicza do szybkiego sprawdzania krawędzi w improve()
+vector<int> pos;       
+vector<int> edgeToNext; 
 
 mt19937 rng(7);
 auto startTime = chrono::steady_clock::now();
@@ -45,9 +45,7 @@ int freeDeg(int u) {
 }
 
 void pushVertex(int v) {
-    if (!path.empty()) {
-        curWeight += getWeight(path.back(), v);
-    }
+    if (!path.empty()) curWeight += getWeight(path.back(), v);
     pos[v] = path.size();
     path.push_back(v);
 }
@@ -63,9 +61,7 @@ int popVertex() {
 void reverseSubpath(int i, int j) {
     curWeight -= pathEdgeWeight(i - 1) + pathEdgeWeight(j);
     reverse(path.begin() + i, path.begin() + j + 1);
-    for (int t = i; t <= j; t++) {
-        pos[path[t]] = t;
-    }
+    for (int t = i; t <= j; t++) pos[path[t]] = t;
     curWeight += pathEdgeWeight(i - 1) + pathEdgeWeight(j);
     minDirtyIdx = min(minDirtyIdx, i);
 }
@@ -75,18 +71,13 @@ void flipPath() {
 }
 
 void setPath(const vector<int>& newPath, long long newWeight, int from = 0) {
-    for (int i = from; i < (int)path.size(); i++) {
-        pos[path[i]] = -1;
-    }
+    for (int i = from; i < (int)path.size(); i++) pos[path[i]] = -1;
     path.resize(newPath.size());
     copy(newPath.begin() + from, newPath.end(), path.begin() + from);
-    for (int i = from; i < (int)path.size(); i++) {
-        pos[path[i]] = i;
-    }
+    for (int i = from; i < (int)path.size(); i++) pos[path[i]] = i;
     curWeight = newWeight;
 }
 
-// Zachłanne przedłużanie końca ścieżki z karą za wysoki stopień swobody
 void grow(double degPenalty) {
     for (;;) {
         int bestNext = -1;
@@ -106,7 +97,6 @@ void grow(double degPenalty) {
     }
 }
 
-// Rotacja Pósy odwracająca sufiks ścieżki, aby odblokować możliwość dalszego wzrostu
 bool rotateEnd() {
     int last = path.size() - 1;
     vector<int> goodCandidates, allCandidates;
@@ -114,13 +104,10 @@ bool rotateEnd() {
         int i = pos[e.first];
         if (i < 0 || i >= last - 1) continue;
         allCandidates.push_back(i);
-        if (freeDeg(path[i + 1]) > 0) {
-            goodCandidates.push_back(i);
-        }
+        if (freeDeg(path[i + 1]) > 0) goodCandidates.push_back(i);
     }
     vector<int>& candidates = goodCandidates.empty() ? allCandidates : goodCandidates;
     if (candidates.empty()) return false;
-
     int splitIdx = candidates[rng() % candidates.size()];
     reverseSubpath(splitIdx + 1, last);
     return true;
@@ -145,12 +132,10 @@ void growEnd(double degPenalty, int maxTries) {
     }
 }
 
-// Lokalna poprawa ścieżki: podmiana pojedynczych wierzchołków oraz wstawianie 1-2 nowych
 bool improve(int from) {
     bool improved = false;
     int len = path.size();
 
-    // 1. Podmiana wierzchołka: a -> c -> b na a -> x -> b
     for (int i = max(from, 1); i + 1 < len; i++) {
         int a = path[i - 1], c = path[i], b = path[i + 1];
         int oldW = getWeight(a, c) + getWeight(c, b);
@@ -175,7 +160,6 @@ bool improve(int from) {
         }
     }
 
-    // 2. Wstawianie 1 lub 2 wolnych wierzchołków pomiędzy sąsiednie a -> b
     vector<int> newPath(path.begin(), path.begin() + from);
     for (int i = from; i < len; i++) {
         int a = path[i];
@@ -218,12 +202,38 @@ bool improve(int from) {
             }
         }
     }
-
     path = newPath;
-    for (int i = from; i < (int)path.size(); i++) {
-        pos[path[i]] = i;
-    }
+    for (int i = from; i < (int)path.size(); i++) pos[path[i]] = i;
     return improved;
+}
+
+bool apply2Opt(int from) {
+    bool any_improved = false;
+    bool local_improvement = true;
+    while (local_improvement && elapsed() < TIME_LIMIT) {
+        local_improvement = false;
+        int L = path.size();
+        if (L < 4) return false;
+        
+        for (int i = max(from, 1); i < L - 2; i++) {
+            int a = path[i - 1], b = path[i], w_ab = pathEdgeWeight(i - 1);
+            for (auto& edge_ac : adj[a]) {
+                int c = edge_ac.first, j = pos[c];
+                if (j >= i + 1 && j < L - 1) {
+                    int w_ac = edge_ac.second, d = path[j + 1];
+                    int w_cd = pathEdgeWeight(j), w_bd = getWeight(b, d);
+                    
+                    if (w_bd > 0 && w_ac + w_bd > w_ab + w_cd) {
+                        reverseSubpath(i, j);
+                        local_improvement = any_improved = true;
+                        break; 
+                    }
+                }
+            }
+            if (local_improvement) break; 
+        }
+    }
+    return any_improved;
 }
 
 void extendBothEnds(double degPenalty, int maxTries) {
@@ -235,7 +245,6 @@ void extendBothEnds(double degPenalty, int maxTries) {
     }
 }
 
-// Budowa lasu DFS i znalezienie w nim najcięższej ścieżki (średnicy drzewa)
 vector<int> dfsPath(double degPenalty) {
     vector<int> parent(n, -1), parentWeight(n, 0), headIdx(n, 0), seen(n, 0);
     vector<int> bestChild1(n, -1), bestChild2(n, -1), order, stack, roots(n);
@@ -255,47 +264,35 @@ vector<int> dfsPath(double degPenalty) {
 
     for (int r : roots) {
         if (!seen[r]) {
-            seen[r] = 1;
-            order.push_back(r);
-            stack.push_back(r);
+            seen[r] = 1; order.push_back(r); stack.push_back(r);
             while (!stack.empty()) {
                 int v = stack.back();
                 if (headIdx[v] == (int)sortedAdj[v].size()) {
-                    stack.pop_back();
-                    continue;
+                    stack.pop_back(); continue;
                 }
                 int u = sortedAdj[v][headIdx[v]++].second;
                 if (seen[u]) continue;
-                seen[u] = 1;
-                parent[u] = v;
-                parentWeight[u] = getWeight(v, u);
-                order.push_back(u);
-                stack.push_back(u);
+                seen[u] = 1; parent[u] = v; parentWeight[u] = getWeight(v, u);
+                order.push_back(u); stack.push_back(u);
             }
         }
     }
 
-    // Programowanie dynamiczne na drzewie DFS (dwie najdłuższe gałęzie w dół z każdego u)
     for (int i = n - 1; i >= 0; i--) {
         int v = order[i], u = parent[v];
         if (u < 0) continue;
         long long d = maxDown1[v] + parentWeight[v];
         if (d > maxDown1[u]) {
-            maxDown2[u] = maxDown1[u];
-            bestChild2[u] = bestChild1[u];
-            maxDown1[u] = d;
-            bestChild1[u] = v;
+            maxDown2[u] = maxDown1[u]; bestChild2[u] = bestChild1[u];
+            maxDown1[u] = d; bestChild1[u] = v;
         } else if (d > maxDown2[u]) {
-            maxDown2[u] = d;
-            bestChild2[u] = v;
+            maxDown2[u] = d; bestChild2[u] = v;
         }
     }
 
     int bestLca = 0;
     for (int x = 0; x < n; x++) {
-        if (maxDown1[x] + maxDown2[x] > maxDown1[bestLca] + maxDown2[bestLca]) {
-            bestLca = x;
-        }
+        if (maxDown1[x] + maxDown2[x] > maxDown1[bestLca] + maxDown2[bestLca]) bestLca = x;
     }
 
     vector<int> res;
@@ -306,7 +303,8 @@ vector<int> dfsPath(double degPenalty) {
 }
 
 int main() {
-    scanf("%d %d", &n, &m);
+    if (scanf("%d %d", &n, &m) != 2) return 0;
+    
     adj.resize(n);
     pos.assign(n, -1);
     edgeToNext.assign(n, 0);
@@ -319,7 +317,6 @@ int main() {
         }
     }
 
-    // Usunięcie krawędzi wielokrotnych (zostaje najcięższa) i posortowanie list sąsiedztwa
     for (auto& neighbors : adj) {
         sort(neighbors.begin(), neighbors.end(), [](const pair<int, int>& x, const pair<int, int>& y) {
             return x.first != y.first ? x.first < y.first : x.second > y.second;
@@ -330,70 +327,106 @@ int main() {
     }
 
     double penalties[] = {0, 5, 15, 30};
-    vector<int> bestPath = {0};
-    long long bestWeight = 0;
+    
+    // Zmienne do przechowywania ABSOLUTNIE najlepszego wyniku z wszystkich restartów
+    vector<int> globalBestPath = {0};
+    long long globalBestWeight = 0;
+    
+    int restartsCounter = 0;
 
-    // Faza 1: Konstrukcja początkowych ścieżek i wybór najlepszej
-    for (int t = 0; t < 8 && elapsed() < TIME_LIMIT / 4; t++) {
-        double penalty = penalties[t % 4];
+    // GŁÓWNA PĘTLA - ILS with Restarts
+    while (elapsed() < TIME_LIMIT) {
+        
+        // 1. Zbudowanie nowej ścieżki początkowej (nowy rejon eksploracji)
+        double penalty = penalties[restartsCounter % 4];
         vector<int> initPath = dfsPath(penalty);
         long long w = 0;
         for (int i = 0; i + 1 < (int)initPath.size(); i++) {
             w += getWeight(initPath[i], initPath[i + 1]);
         }
+        
         setPath(initPath, w);
         extendBothEnds(penalty, BUILD_TRIES);
-        for (int r = 0; r < 5 && improve(0) && elapsed() < TIME_LIMIT / 4; r++) {
-            extendBothEnds(penalty, BUILD_TRIES);
+        
+        // Lokalne zmienne dla tego konkretnego "uruchomienia"
+        long long localBestWeight = curWeight;
+        vector<int> localBestPath = path;
+        
+        int stagnation = 0;
+        int iter = 0;
+
+        // 2. Ostra eksploatacja (Hill Climbing) z głębokimi uszkodzeniami dopóki nie ma stagnacji
+        // Próg stagnacji 300 - po tylu krokach bez poprawy wyrzucamy tę ścieżkę do kosza
+        while (elapsed() < TIME_LIMIT && stagnation < 300) {
+            iter++;
+            stagnation++;
+
+            if (rng() % 2) {
+                flipPath();
+                reverse(localBestPath.begin(), localBestPath.end());
+            }
+            minDirtyIdx = path.size();
+            if (rng() % 2) rotateEnd();
+
+            // --- ZMIANA: MASYWNA EKSPLORACJA KROKOWA (Nuclear Kicks) ---
+            int L = path.size();
+            int dropCount = 0;
+            int r = rng() % 100;
+            
+            if (r < 5) {
+                // 5% szans na NUCLEAR KICK: Usuwamy od 40% do 90% całej ścieżki!
+                dropCount = L * (0.4 + (rng() % 50) / 100.0); 
+            } else if (r < 30) {
+                dropCount = rng() % 5000;
+            } else {
+                dropCount = rng() % 100;
+            }
+
+            int keepIdx = max(0, L - 2 - dropCount);
+            while (keepIdx > 0 && freeDeg(path[keepIdx]) == 0) keepIdx--;
+            while ((int)path.size() > keepIdx + 1) popVertex();
+
+            minDirtyIdx = min(minDirtyIdx, keepIdx + 1);
+            
+            // Odbudowa
+            growEnd(penalties[rng() % 4], KICK_TRIES);
+
+            // Klasyczne usprawnienia
+            if (iter % 100 == 0) {
+                minDirtyIdx = 0;
+                improve(0);
+                apply2Opt(0); // 2-opt zoptymalizowany pod listę sąsiedztwa
+            } else {
+                int start = max(max(minDirtyIdx - 2, (int)path.size() - 1000), 0);
+                improve(start);
+                apply2Opt(start);
+            }
+
+            int syncFrom = max(minDirtyIdx - 3, 0);
+            
+            // Wgrywamy lokalnie ulepszoną ścieżkę
+            if (curWeight >= localBestWeight) {
+                if (curWeight > localBestWeight) stagnation = 0; // Reset stagnacji = jesteśmy na dobrym tropie
+                localBestWeight = curWeight;
+                localBestPath.resize(path.size());
+                copy(path.begin() + syncFrom, path.end(), localBestPath.begin() + syncFrom);
+            } else {
+                setPath(localBestPath, localBestWeight, syncFrom);
+            }
         }
-        if (curWeight > bestWeight) {
-            bestWeight = curWeight;
-            bestPath = path;
+        
+        // Zakończono lokalną wspinaczkę. Sprawdzamy czy pobiliśmy rekord globalny.
+        if (localBestWeight > globalBestWeight) {
+            globalBestWeight = localBestWeight;
+            globalBestPath = localBestPath;
         }
+        
+        restartsCounter++;
     }
 
-    // Faza 2: Iteracyjne przeszukiwanie lokalne (częściowe cofanie i odbudowa ścieżki)
-    setPath(bestPath, bestWeight);
-    int iter = 0;
-    while (elapsed() < TIME_LIMIT && ++iter) {
-        if (rng() % 2) {
-            flipPath();
-            reverse(bestPath.begin(), bestPath.end());
-        }
-        minDirtyIdx = path.size();
-        if (rng() % 2) {
-            rotateEnd();
-        }
-
-        int keepIdx = max(0, (int)path.size() - 2 - (int)(rng() % (rng() % 20 ? 100 : 5000)));
-        while (keepIdx > 0 && freeDeg(path[keepIdx]) == 0) {
-            keepIdx--;
-        }
-        while ((int)path.size() > keepIdx + 1) {
-            popVertex();
-        }
-
-        minDirtyIdx = min(minDirtyIdx, keepIdx + 1);
-        growEnd(penalties[rng() % 4], KICK_TRIES);
-
-        if (iter % 100 == 0) {
-            minDirtyIdx = 0;
-            improve(0);
-        } else {
-            improve(max(max(minDirtyIdx - 2, (int)path.size() - 1000), 0));
-        }
-
-        int syncFrom = max(minDirtyIdx - 3, 0);
-        if (curWeight >= bestWeight) {
-            bestWeight = curWeight;
-            bestPath.resize(path.size());
-            copy(path.begin() + syncFrom, path.end(), bestPath.begin() + syncFrom);
-        } else {
-            setPath(bestPath, bestWeight, syncFrom);
-        }
-    }
-
-    printf("%d\n", (int)bestPath.size());
-    for (int v : bestPath) printf("%d ", v);
+    printf("%d\n", (int)globalBestPath.size());
+    for (int v : globalBestPath) printf("%d ", v);
     printf("\n");
+    
+    return 0;
 }
