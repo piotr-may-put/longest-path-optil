@@ -450,7 +450,7 @@ int main() {
     long long bestWeight = 0;
 
     // Faza 1: Konstrukcja początkowych ścieżek i wybór najlepszej
-    for (int t = 0; t < 8 && elapsed() < TIME_LIMIT / 4; t++) {
+    for (int t = 0; elapsed() < TIME_LIMIT / 3.5; t++) {
         double penalty = penalties[t % 4];
         vector<int> initPath = dfsPath(penalty);
         long long w = 0;
