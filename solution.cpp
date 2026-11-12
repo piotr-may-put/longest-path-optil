@@ -1,489 +1,399 @@
-#include <bits/stdc++.h>
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <random>
+#include <vector>
 using namespace std;
 
-// Compressed Sparse Row (CSR) graph representation for fast cache-friendly traversal
-static int N, M;
-static int *adjStart, *adjTo, *adjW;
+const double TIME_LIMIT = 25.0;
+const int BUILD_TRIES = 100;
+const int KICK_TRIES = 20;
 
-// Global best solution found
-static vector<int> bestPath;
-static long long bestScore = 0;
+int n, m;
+int minDirtyIdx; // Najmniejszy indeks, od którego ścieżka uległa zmianie
+long long curWeight;
 
-static mt19937 rng(42);
-static chrono::steady_clock::time_point startTime;
-static int TIME_LIMIT = 29500; // 29.5 seconds (leaving 0.5s margin for I/O)
+vector<vector<pair<int, int>>> adj;
+vector<int> path;
+vector<int> pos;       // Pozycja wierzchołka w ścieżce (-1 jeśli poza ścieżką)
+vector<int> edgeToNext; // Tablica pomocnicza do szybkiego sprawdzania krawędzi w improve()
 
-inline int elapsedMs() {
-    return (int)chrono::duration_cast<chrono::milliseconds>(
-        chrono::steady_clock::now() - startTime).count();
+mt19937 rng(7);
+auto startTime = chrono::steady_clock::now();
+
+double elapsed() {
+    return chrono::duration<double>(chrono::steady_clock::now() - startTime).count();
 }
 
-// Find weight of edge (u, v); returns 0 if not connected
-inline int getEdgeWeight(int u, int v) {
-    for (int i = adjStart[u]; i < adjStart[u + 1]; i++) {
-        if (adjTo[i] == v) return adjW[i];
-    }
-    return 0;
+int getWeight(int a, int b) {
+    auto it = lower_bound(adj[a].begin(), adj[a].end(), b,
+        [](const pair<int, int>& e, int v) { return e.first < v; });
+    return (it != adj[a].end() && it->first == b) ? it->second : 0;
 }
 
-// Maintains the current path and O(1) position lookup
-struct PathState {
-    vector<int> path;       // Ordered list of vertices on the path
-    vector<int> pos;        // pos[v] = index in path, or -1 if not on path
-    long long score = 0;
-
-    PathState(int n) : pos(n, -1) {}
-
-    void clear() {
-        for (int v : path) pos[v] = -1;
-        path.clear();
-        score = 0;
-    }
-
-    void init(int startNode) {
-        clear();
-        path.push_back(startNode);
-        pos[startNode] = 0;
-    }
-
-    void pushBack(int v, int w) {
-        pos[v] = (int)path.size();
-        path.push_back(v);
-        score += w;
-    }
-
-    void reversePath() {
-        reverse(path.begin(), path.end());
-        for (int i = 0; i < (int)path.size(); i++) {
-            pos[path[i]] = i;
-        }
-    }
-
-    void reverseSubsegment(int fromIdx, int toIdx) {
-        reverse(path.begin() + fromIdx, path.begin() + toIdx + 1);
-        for (int i = fromIdx; i <= toIdx; i++) {
-            pos[path[i]] = i;
-        }
-    }
-};
-
-// Extend path from its back end greedily (preferring heavier edges)
-bool extendEnd(PathState& state, bool randomize) {
-    bool extended = false;
-    while (true) {
-        int u = state.path.back();
-        
-        int c1 = -1, w1 = 0;
-        int c2 = -1, w2 = 0;
-        int c3 = -1, w3 = 0;
-
-        for (int i = adjStart[u]; i < adjStart[u + 1]; i++) {
-            int v = adjTo[i], w = adjW[i];
-            if (state.pos[v] != -1) continue; // already on path
-
-            if (w > w1) {
-                c3 = c2; w3 = w2;
-                c2 = c1; w2 = w1;
-                c1 = v;  w1 = w;
-            } else if (w > w2) {
-                c3 = c2; w3 = w2;
-                c2 = v;  w2 = w;
-            } else if (w > w3) {
-                c3 = v;  w3 = w;
-            }
-        }
-
-        if (c1 == -1) break; // no unvisited neighbors
-
-        int chosen = c1, chosenW = w1;
-        if (randomize && c2 != -1) {
-            long long tot = (long long)w1 * w1 + (long long)w2 * w2;
-            if (c3 != -1) tot += (long long)w3 * w3;
-            long long r = rng() % tot;
-            if (r < (long long)w1 * w1) {
-                chosen = c1; chosenW = w1;
-            } else if (r < (long long)w1 * w1 + (long long)w2 * w2) {
-                chosen = c2; chosenW = w2;
-            } else {
-                chosen = c3; chosenW = w3;
-            }
-        }
-
-        state.pushBack(chosen, chosenW);
-        extended = true;
-    }
-    return extended;
+int pathEdgeWeight(int i) {
+    return (i >= 0 && i + 1 < (int)path.size()) ? getWeight(path[i], path[i + 1]) : 0;
 }
 
-// Extend from back, reverse, and extend from new back (both ends)
-bool extendBothEnds(PathState& state, bool randomize) {
-    bool e1 = extendEnd(state, randomize);
-    state.reversePath();
-    bool e2 = extendEnd(state, randomize);
-    return e1 || e2;
+int freeDeg(int u) {
+    int deg = 0;
+    for (auto& e : adj[u]) {
+        deg += (pos[e.first] < 0);
+    }
+    return deg;
 }
 
-// Try rotation: first seeks an unvisited neighbor; falls back to exploratory rotation
-bool tryRotation(PathState& state) {
-    int k = (int)state.path.size();
-    if (k < 4) return false;
-
-    int u = state.path.back();
-    
-    int bestI = -1;
-    int bestGain = -1e9;
-    int bestNewW = 0, bestOldW = 0;
-    bool foundFree = false;
-
-    for (int idx = adjStart[u]; idx < adjStart[u + 1]; idx++) {
-        int vi = adjTo[idx];
-        int i = state.pos[vi];
-        if (i < 0 || i >= k - 2) continue;
-
-        int vi_next = state.path[i + 1];
-        int oldW = getEdgeWeight(vi, vi_next);
-        int newW = adjW[idx];
-        int gain = newW - oldW;
-
-        // Check if vi_next has unvisited neighbors
-        bool hasFreeNeighbor = false;
-        for (int j = adjStart[vi_next]; j < adjStart[vi_next + 1]; j++) {
-            if (state.pos[adjTo[j]] == -1) {
-                hasFreeNeighbor = true;
-                break;
-            }
-        }
-
-        if (hasFreeNeighbor) {
-            foundFree = true;
-            if (gain + 1000 > bestGain) {
-                bestGain = gain + 1000;
-                bestI = i;
-                bestNewW = newW;
-                bestOldW = oldW;
-            }
-        } else if (!foundFree && gain > bestGain && gain >= -15) {
-            bestGain = gain;
-            bestI = i;
-            bestNewW = newW;
-            bestOldW = oldW;
-        }
+void pushVertex(int v) {
+    if (!path.empty()) {
+        curWeight += getWeight(path.back(), v);
     }
-
-    if (bestI != -1) {
-        state.score += (bestNewW - bestOldW);
-        state.reverseSubsegment(bestI + 1, k - 1);
-        return true;
-    }
-
-    return false;
+    pos[v] = path.size();
+    path.push_back(v);
 }
 
-// Splicing: Try inserting unvisited vertices between consecutive path vertices
-int tryInsertions(PathState& state) {
-    int insertedCount = 0;
-    int k = (int)state.path.size();
-    if (k >= N) return 0;
-
-    for (int x = 0; x < N; x++) {
-        if (state.pos[x] != -1) continue;
-
-        // Check if x has at least 2 neighbors on the path
-        vector<pair<int,int>> pathNbrs;
-        for (int i = adjStart[x]; i < adjStart[x + 1]; i++) {
-            int v = adjTo[i];
-            if (state.pos[v] != -1) {
-                pathNbrs.push_back({state.pos[v], adjW[i]});
-            }
-        }
-
-        if (pathNbrs.size() < 2) continue;
-        sort(pathNbrs.begin(), pathNbrs.end());
-
-        for (int j = 0; j + 1 < (int)pathNbrs.size(); j++) {
-            int p1 = pathNbrs[j].first;
-            int p2 = pathNbrs[j + 1].first;
-            if (p2 - p1 != 1) continue;
-
-            int u = state.path[p1];
-            int v = state.path[p2];
-            int oldW = getEdgeWeight(u, v);
-            int newW = pathNbrs[j].second + pathNbrs[j + 1].second;
-
-            if (newW >= oldW) {
-                state.path.insert(state.path.begin() + p2, x);
-                state.score += (newW - oldW);
-                for (int idx = p2; idx < (int)state.path.size(); idx++) {
-                    state.pos[state.path[idx]] = idx;
-                }
-                insertedCount++;
-                break;
-            }
-        }
-    }
-    return insertedCount;
+int popVertex() {
+    int v = path.back();
+    curWeight -= pathEdgeWeight(path.size() - 2);
+    pos[v] = -1;
+    path.pop_back();
+    return v;
 }
 
-// Build a path from startNode using extensions and rotations
-void searchPath(int startNode, PathState& state) {
-    state.init(startNode);
-    extendBothEnds(state, true);
-
-    int failCount = 0;
-    int maxFails = min(150, max(30, N / 200));
-
-    while (failCount < maxFails) {
-        bool rotated = tryRotation(state);
-        if (!rotated) {
-            state.reversePath();
-            rotated = tryRotation(state);
-        }
-        if (!rotated) {
-            failCount += 5;
-            continue;
-        }
-
-        bool ext = extendBothEnds(state, false);
-        if (ext) {
-            failCount = 0; // reset because path grew
-        } else {
-            failCount++;
-        }
+void reverseSubpath(int i, int j) {
+    curWeight -= pathEdgeWeight(i - 1) + pathEdgeWeight(j);
+    reverse(path.begin() + i, path.begin() + j + 1);
+    for (int t = i; t <= j; t++) {
+        pos[path[t]] = t;
     }
-
-    tryInsertions(state);
-
-    if (state.score > bestScore) {
-        bestScore = state.score;
-        bestPath = state.path;
-    }
+    curWeight += pathEdgeWeight(i - 1) + pathEdgeWeight(j);
+    minDirtyIdx = min(minDirtyIdx, i);
 }
 
-// Cut a fraction of the path from an end and re-extend
-void perturbPath(PathState& state) {
-    int k = (int)state.path.size();
-    if (k < 10) return;
-
-    int cutCount = max(3, (int)(k * (0.05 + 0.20 * (rng() % 1000) / 1000.0)));
-    cutCount = min(cutCount, k - 2);
-
-    if (rng() % 2 == 0) {
-        state.reversePath();
-    }
-
-    for (int i = 0; i < cutCount; i++) {
-        int removed = state.path.back();
-        state.pos[removed] = -1;
-        state.path.pop_back();
-        int newEnd = state.path.back();
-        state.score -= getEdgeWeight(newEnd, removed);
-    }
-
-    extendBothEnds(state, true);
-
-    int failCount = 0;
-    int maxFails = min(100, max(20, N / 300));
-
-    while (failCount < maxFails) {
-        bool rotated = tryRotation(state);
-        if (!rotated) {
-            state.reversePath();
-            rotated = tryRotation(state);
-        }
-        if (!rotated) { failCount += 5; continue; }
-
-        bool ext = extendBothEnds(state, false);
-        if (ext) failCount = 0;
-        else failCount++;
-    }
-
-    tryInsertions(state);
-
-    if (state.score > bestScore) {
-        bestScore = state.score;
-        bestPath = state.path;
-    }
+void flipPath() {
+    reverseSubpath(0, path.size() - 1);
 }
 
-// BFS to find the farthest node by total edge weight, returning node and reconstructed path
-pair<int, long long> bfsFarthest(int src, vector<int>& outPath) {
-    vector<long long> dist(N, -1);
-    vector<int> parent(N, -1);
-    queue<int> q;
-    dist[src] = 0;
-    q.push(src);
+void setPath(const vector<int>& newPath, long long newWeight, int from = 0) {
+    for (int i = from; i < (int)path.size(); i++) {
+        pos[path[i]] = -1;
+    }
+    path.resize(newPath.size());
+    copy(newPath.begin() + from, newPath.end(), path.begin() + from);
+    for (int i = from; i < (int)path.size(); i++) {
+        pos[path[i]] = i;
+    }
+    curWeight = newWeight;
+}
 
-    int farthest = src;
-    long long maxDist = 0;
-
-    while (!q.empty()) {
-        int u = q.front();
-        q.pop();
-
-        for (int i = adjStart[u]; i < adjStart[u + 1]; i++) {
-            int v = adjTo[i];
-            if (dist[v] == -1) {
-                dist[v] = dist[u] + adjW[i];
-                parent[v] = u;
-                q.push(v);
-                if (dist[v] > maxDist) {
-                    maxDist = dist[v];
-                    farthest = v;
+// Zachłanne przedłużanie końca ścieżki z karą za wysoki stopień swobody
+void grow(double degPenalty) {
+    for (;;) {
+        int bestNext = -1;
+        double bestScore = -1e18;
+        for (auto& e : adj[path.back()]) {
+            if (pos[e.first] < 0) {
+                int u = e.first, w = e.second, d = freeDeg(u);
+                double score = w - degPenalty * d - (d == 0) * 1000 + rng() % 20;
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestNext = u;
                 }
             }
         }
+        if (bestNext < 0) return;
+        pushVertex(bestNext);
+    }
+}
+
+// Rotacja Pósy odwracająca sufiks ścieżki, aby odblokować możliwość dalszego wzrostu
+bool rotateEnd() {
+    int last = path.size() - 1;
+    vector<int> goodCandidates, allCandidates;
+    for (auto& e : adj[path[last]]) {
+        int i = pos[e.first];
+        if (i < 0 || i >= last - 1) continue;
+        allCandidates.push_back(i);
+        if (freeDeg(path[i + 1]) > 0) {
+            goodCandidates.push_back(i);
+        }
+    }
+    vector<int>& candidates = goodCandidates.empty() ? allCandidates : goodCandidates;
+    if (candidates.empty()) return false;
+
+    int splitIdx = candidates[rng() % candidates.size()];
+    reverseSubpath(splitIdx + 1, last);
+    return true;
+}
+
+void growEnd(double degPenalty, int maxTries) {
+    grow(degPenalty);
+    for (int t = 0, maxLen = path.size(); t < maxTries && elapsed() < TIME_LIMIT; t++) {
+        if (!rotateEnd()) {
+            if (path.size() == 1) return;
+            int v = popVertex();
+            if (!rotateEnd()) {
+                pushVertex(v);
+                return;
+            }
+        }
+        grow(degPenalty);
+        if ((int)path.size() > maxLen) {
+            maxLen = path.size();
+            t = 0;
+        }
+    }
+}
+
+// Lokalna poprawa ścieżki: podmiana pojedynczych wierzchołków oraz wstawianie 1-2 nowych
+bool improve(int from) {
+    bool improved = false;
+    int len = path.size();
+
+    // 1. Podmiana wierzchołka: a -> c -> b na a -> x -> b
+    for (int i = max(from, 1); i + 1 < len; i++) {
+        int a = path[i - 1], c = path[i], b = path[i + 1];
+        int oldW = getWeight(a, c) + getWeight(c, b);
+        int bestW = oldW, bestX = -1;
+
+        for (auto& e : adj[b]) edgeToNext[e.first] = e.second;
+        for (auto& e : adj[a]) {
+            int x = e.first, w = e.second;
+            if (pos[x] < 0 && edgeToNext[x] && w + edgeToNext[x] > bestW) {
+                bestW = w + edgeToNext[x];
+                bestX = x;
+            }
+        }
+        for (auto& e : adj[b]) edgeToNext[e.first] = 0;
+
+        if (bestX >= 0) {
+            pos[c] = -1;
+            pos[bestX] = i;
+            path[i] = bestX;
+            curWeight += bestW - oldW;
+            improved = true;
+        }
     }
 
-    outPath.clear();
-    int curr = farthest;
-    while (curr != -1) {
-        outPath.push_back(curr);
-        curr = parent[curr];
+    // 2. Wstawianie 1 lub 2 wolnych wierzchołków pomiędzy sąsiednie a -> b
+    vector<int> newPath(path.begin(), path.begin() + from);
+    for (int i = from; i < len; i++) {
+        int a = path[i];
+        newPath.push_back(a);
+        if (i + 1 == len) break;
+
+        int b = path[i + 1];
+        int oldW = getWeight(a, b);
+        int bestW = oldW, bestX = -1, bestY = -1;
+
+        for (auto& e : adj[b]) edgeToNext[e.first] = e.second;
+        for (auto& e : adj[a]) {
+            if (pos[e.first] < 0) {
+                int x = e.first, wx = e.second;
+                if (edgeToNext[x] && wx + edgeToNext[x] > bestW) {
+                    bestW = wx + edgeToNext[x];
+                    bestX = x;
+                    bestY = -1;
+                }
+                for (auto& f : adj[x]) {
+                    int y = f.first, wy = f.second;
+                    if (pos[y] < 0 && edgeToNext[y] && wx + wy + edgeToNext[y] > bestW) {
+                        bestW = wx + wy + edgeToNext[y];
+                        bestX = x;
+                        bestY = y;
+                    }
+                }
+            }
+        }
+        for (auto& e : adj[b]) edgeToNext[e.first] = 0;
+
+        if (bestX >= 0) {
+            newPath.push_back(bestX);
+            pos[bestX] = 0;
+            curWeight += bestW - oldW;
+            improved = true;
+            if (bestY >= 0) {
+                newPath.push_back(bestY);
+                pos[bestY] = 0;
+            }
+        }
     }
-    return {farthest, maxDist};
+
+    path = newPath;
+    for (int i = from; i < (int)path.size(); i++) {
+        pos[path[i]] = i;
+    }
+    return improved;
+}
+
+void extendBothEnds(double degPenalty, int maxTries) {
+    for (int stuck = 0; stuck < 2;) {
+        int prevLen = path.size();
+        growEnd(degPenalty, maxTries);
+        flipPath();
+        stuck = ((int)path.size() > prevLen) ? 0 : stuck + 1;
+    }
+}
+
+// Budowa lasu DFS i znalezienie w nim najcięższej ścieżki (średnicy drzewa)
+vector<int> dfsPath(double degPenalty) {
+    vector<int> parent(n, -1), parentWeight(n, 0), headIdx(n, 0), seen(n, 0);
+    vector<int> bestChild1(n, -1), bestChild2(n, -1), order, stack, roots(n);
+    vector<long long> maxDown1(n, 0), maxDown2(n, 0);
+    vector<vector<pair<int, int>>> sortedAdj(n);
+
+    for (int v = 0; v < n; v++) {
+        for (auto& e : adj[v]) {
+            int priority = -(int)(e.second - degPenalty * adj[e.first].size() + rng() % 20);
+            sortedAdj[v].push_back({priority, e.first});
+        }
+        sort(sortedAdj[v].begin(), sortedAdj[v].end());
+    }
+
+    for (int v = 0; v < n; v++) roots[v] = v;
+    shuffle(roots.begin(), roots.end(), rng);
+
+    for (int r : roots) {
+        if (!seen[r]) {
+            seen[r] = 1;
+            order.push_back(r);
+            stack.push_back(r);
+            while (!stack.empty()) {
+                int v = stack.back();
+                if (headIdx[v] == (int)sortedAdj[v].size()) {
+                    stack.pop_back();
+                    continue;
+                }
+                int u = sortedAdj[v][headIdx[v]++].second;
+                if (seen[u]) continue;
+                seen[u] = 1;
+                parent[u] = v;
+                parentWeight[u] = getWeight(v, u);
+                order.push_back(u);
+                stack.push_back(u);
+            }
+        }
+    }
+
+    // Programowanie dynamiczne na drzewie DFS (dwie najdłuższe gałęzie w dół z każdego u)
+    for (int i = n - 1; i >= 0; i--) {
+        int v = order[i], u = parent[v];
+        if (u < 0) continue;
+        long long d = maxDown1[v] + parentWeight[v];
+        if (d > maxDown1[u]) {
+            maxDown2[u] = maxDown1[u];
+            bestChild2[u] = bestChild1[u];
+            maxDown1[u] = d;
+            bestChild1[u] = v;
+        } else if (d > maxDown2[u]) {
+            maxDown2[u] = d;
+            bestChild2[u] = v;
+        }
+    }
+
+    int bestLca = 0;
+    for (int x = 0; x < n; x++) {
+        if (maxDown1[x] + maxDown2[x] > maxDown1[bestLca] + maxDown2[bestLca]) {
+            bestLca = x;
+        }
+    }
+
+    vector<int> res;
+    for (int x = bestChild2[bestLca]; x >= 0; x = bestChild1[x]) res.push_back(x);
+    reverse(res.begin(), res.end());
+    for (int x = bestLca; x >= 0; x = bestChild1[x]) res.push_back(x);
+    return res;
 }
 
 int main() {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
-    startTime = chrono::steady_clock::now();
+    scanf("%d %d", &n, &m);
+    adj.resize(n);
+    pos.assign(n, -1);
+    edgeToNext.assign(n, 0);
 
-    const char* tlEnv = getenv("TIME_LIMIT_MS");
-    if (tlEnv) TIME_LIMIT = atoi(tlEnv);
-
-    cin >> N >> M;
-
-    vector<vector<pair<int,int>>> tmpAdj(N);
-    for (int i = 0; i < M; i++) {
-        int u, v, w;
-        cin >> u >> v >> w;
-        tmpAdj[u].push_back({v, w});
-        tmpAdj[v].push_back({u, w});
+    for (int i = 0, u, v, w; i < m; i++) {
+        scanf("%d %d %d", &u, &v, &w);
+        if (u != v) {
+            adj[u].push_back({v, w});
+            adj[v].push_back({u, w});
+        }
     }
 
-    // Sort adjacency lists by weight descending
-    for (int i = 0; i < N; i++) {
-        sort(tmpAdj[i].begin(), tmpAdj[i].end(), [](const pair<int,int>& a, const pair<int,int>& b) {
-            return a.second > b.second;
+    // Usunięcie krawędzi wielokrotnych (zostaje najcięższa) i posortowanie list sąsiedztwa
+    for (auto& neighbors : adj) {
+        sort(neighbors.begin(), neighbors.end(), [](const pair<int, int>& x, const pair<int, int>& y) {
+            return x.first != y.first ? x.first < y.first : x.second > y.second;
         });
+        neighbors.erase(unique(neighbors.begin(), neighbors.end(), [](const pair<int, int>& x, const pair<int, int>& y) {
+            return x.first == y.first;
+        }), neighbors.end());
     }
 
-    // Build CSR representation
-    adjStart = new int[N + 1];
-    adjStart[0] = 0;
-    for (int i = 0; i < N; i++) {
-        adjStart[i + 1] = adjStart[i] + (int)tmpAdj[i].size();
-    }
-    int totalEdges = adjStart[N];
-    adjTo = new int[totalEdges];
-    adjW = new int[totalEdges];
-    for (int i = 0; i < N; i++) {
-        int off = adjStart[i];
-        for (int j = 0; j < (int)tmpAdj[i].size(); j++) {
-            adjTo[off + j] = tmpAdj[i][j].first;
-            adjW[off + j] = tmpAdj[i][j].second;
+    double penalties[] = {0, 5, 15, 30};
+    vector<int> bestPath = {0};
+    long long bestWeight = 0;
+
+    // Faza 1: Konstrukcja początkowych ścieżek i wybór najlepszej
+    for (int t = 0; t < 8 && elapsed() < TIME_LIMIT / 4; t++) {
+        double penalty = penalties[t % 4];
+        vector<int> initPath = dfsPath(penalty);
+        long long w = 0;
+        for (int i = 0; i + 1 < (int)initPath.size(); i++) {
+            w += getWeight(initPath[i], initPath[i + 1]);
         }
-    }
-    tmpAdj.clear();
-    tmpAdj.shrink_to_fit();
-
-    // Collect candidate starting vertices:
-    // 1. Extreme endpoints from BFS diameter finding (also optimal for trees)
-    vector<int> startNodes;
-    vector<int> bfsPath1, bfsPath2;
-    auto [f1, d1] = bfsFarthest(0, bfsPath1);
-    auto [f2, d2] = bfsFarthest(f1, bfsPath2);
-    if (d2 > bestScore) {
-        bestScore = d2;
-        bestPath = bfsPath2;
-    }
-    startNodes.push_back(f1);
-    startNodes.push_back(f2);
-    vector<int> bfsPath3;
-    auto [f3, d3] = bfsFarthest(f2, bfsPath3);
-    if (d3 > bestScore) {
-        bestScore = d3;
-        bestPath = bfsPath3;
-    }
-    startNodes.push_back(f3);
-
-    // 2. Leaf nodes (degree 1)
-    for (int i = 0; i < N; i++) {
-        if (adjStart[i + 1] - adjStart[i] == 1) {
-            startNodes.push_back(i);
+        setPath(initPath, w);
+        extendBothEnds(penalty, BUILD_TRIES);
+        for (int r = 0; r < 5 && improve(0) && elapsed() < TIME_LIMIT / 4; r++) {
+            extendBothEnds(penalty, BUILD_TRIES);
+        }
+        if (curWeight > bestWeight) {
+            bestWeight = curWeight;
+            bestPath = path;
         }
     }
 
-    // 3. Nodes with highest weighted degree
-    vector<pair<long long, int>> degList;
-    for (int u = 0; u < N; u++) {
-        long long sumW = 0;
-        for (int i = adjStart[u]; i < adjStart[u + 1]; i++) sumW += adjW[i];
-        degList.push_back({sumW, u});
-    }
-    sort(degList.rbegin(), degList.rend());
-    for (int i = 0; i < min(N, 100); i++) {
-        startNodes.push_back(degList[i].second);
-    }
+    // Faza 2: Iteracyjne przeszukiwanie lokalne (częściowe cofanie i odbudowa ścieżki)
+    setPath(bestPath, bestWeight);
+    int iter = 0;
+    while (elapsed() < TIME_LIMIT && ++iter) {
+        if (rng() % 2) {
+            flipPath();
+            reverse(bestPath.begin(), bestPath.end());
+        }
+        minDirtyIdx = path.size();
+        if (rng() % 2) {
+            rotateEnd();
+        }
 
-    // Remove duplicates
-    sort(startNodes.begin(), startNodes.end());
-    startNodes.erase(unique(startNodes.begin(), startNodes.end()), startNodes.end());
+        int keepIdx = max(0, (int)path.size() - 2 - (int)(rng() % (rng() % 20 ? 100 : 5000)));
+        while (keepIdx > 0 && freeDeg(path[keepIdx]) == 0) {
+            keepIdx--;
+        }
+        while ((int)path.size() > keepIdx + 1) {
+            popVertex();
+        }
 
-    PathState state(N);
+        minDirtyIdx = min(minDirtyIdx, keepIdx + 1);
+        growEnd(penalties[rng() % 4], KICK_TRIES);
 
-    // Phase 1: Search from quality starting nodes (first 40% of time)
-    int phase1End = TIME_LIMIT * 40 / 100;
-    int startIdx = 0;
-    while (elapsedMs() < phase1End) {
-        int startNode;
-        if (startIdx < (int)startNodes.size()) {
-            startNode = startNodes[startIdx++];
+        if (iter % 100 == 0) {
+            minDirtyIdx = 0;
+            improve(0);
         } else {
-            if (rng() % 2 == 0) {
-                startNode = degList[rng() % min(N, 200)].second;
-            } else {
-                startNode = rng() % N;
-            }
+            improve(max(max(minDirtyIdx - 2, (int)path.size() - 1000), 0));
         }
-        searchPath(startNode, state);
-    }
 
-    // Phase 2: Perturbation and improvement of the best path found (next 45% of time)
-    int phase2End = TIME_LIMIT * 85 / 100;
-    while (elapsedMs() < phase2End) {
-        state.clear();
-        for (int i = 0; i < (int)bestPath.size(); i++) {
-            state.path.push_back(bestPath[i]);
-            state.pos[bestPath[i]] = i;
-        }
-        state.score = bestScore;
-
-        perturbPath(state);
-    }
-
-    // Phase 3: Final quick random restarts with remaining time
-    while (elapsedMs() < TIME_LIMIT) {
-        int startNode;
-        if (rng() % 2 == 0 && !startNodes.empty()) {
-            startNode = startNodes[rng() % startNodes.size()];
+        int syncFrom = max(minDirtyIdx - 3, 0);
+        if (curWeight >= bestWeight) {
+            bestWeight = curWeight;
+            bestPath.resize(path.size());
+            copy(path.begin() + syncFrom, path.end(), bestPath.begin() + syncFrom);
         } else {
-            startNode = rng() % N;
+            setPath(bestPath, bestWeight, syncFrom);
         }
-        searchPath(startNode, state);
     }
 
-    // Output result
-    cout << bestPath.size() << "\n";
-    for (int i = 0; i < (int)bestPath.size(); i++) {
-        if (i) cout << " ";
-        cout << bestPath[i];
-    }
-    cout << "\n";
-
-    delete[] adjStart;
-    delete[] adjTo;
-    delete[] adjW;
-
-    return 0;
+    printf("%d\n", (int)bestPath.size());
+    for (int v : bestPath) printf("%d ", v);
+    printf("\n");
 }

@@ -1,179 +1,81 @@
-# Longest Path Problem - Optil.io Solution Documentation
+Oto propozycja dokumentacji w formacie Markdown (`.md`), która opisuje dostarczony kod realizujący heurystyczne poszukiwanie ścieżki o maksymalnej wadze (problem NP-trudny, pokrewny do problemu najdłuższej ścieżki/komiwojażera).
 
-## 1. Problem Overview
-The **Longest Path Problem** on an undirected weighted graph asks us to find a simple path (a path with no repeated vertices) such that the sum of the edge weights along the path is maximized.
-
-- **Constraints**: $N \le 1.5 \cdot 10^5$ vertices, $M \le 5 \cdot 10^5$ edges, weights $1 \le w \le 100$.
-- **Time Limit**: 30 seconds.
-- **Computational Complexity**: The Longest Path problem is known to be **NP-hard** (since finding a path of length $N-1$ is equivalent to the Hamiltonian Path problem). Therefore, for graphs with hundreds of thousands of vertices, an exact algorithm (like integer programming or brute-force DFS) cannot finish in 30 seconds. We must design an intelligent, high-speed heuristic tailored for large-scale graphs.
+Możesz skopiować poniższą treść i zapisać ją jako np. `dokumentacja.md`.
 
 ---
 
-## 2. High-Level Architecture
-Our solution is structured into four intuitive phases:
+# Dokumentacja algorytmu: Poszukiwanie ścieżki o maksymalnej wadze w grafie
+
+Niniejszy dokument opisuje działanie, wykorzystane struktury danych oraz propozycje udoskonaleń dla heurystycznego algorytmu wyznaczania najcięższej ścieżki (ang. *longest path problem* / *maximum weight path*) w grafie nieskierowanym. Algorytm działa w z góry określonym oknie czasowym (ang. *time limit*).
+
+## 1. Krótki opis działania
+
+Algorytm opiera się na strategii **Iterated Local Search (ILS)** z elementami **randomizacji** oraz **rotacji Pósy** (Pósa rotations). Składa się z dwóch głównych faz.
+
+### Pseudokod (High-level)
+
+```text
+1. Wczytaj graf i usuń krawędzie wielokrotne (zostaw najcięższe).
+2. [Faza 1: Inicjalizacja] Wykonaj 8 prób (ograniczonych czasowo):
+   a. Wygeneruj losowe drzewo rozpinające za pomocą DFS (krawędzie mają zmodyfikowane wagi na podstawie stopnia wierzchołka).
+   b. Znajdź najcięższą ścieżkę w tym drzewie (średnicę) używając programowania dynamicznego.
+   c. Próbuj przedłużyć ścieżkę na obu jej końcach (zachłannie).
+   d. Wykonaj przeszukiwanie lokalne (poprawa ścieżki).
+   e. Zapisz najlepszą znalezioną ścieżkę.
+3. [Faza 2: Optymalizacja / Random Kick] Powtarzaj aż minie TIME_LIMIT (25s):
+   a. Z prawdopodobieństwem 50% odwróć całą ścieżkę (zamiana początku z końcem).
+   b. Z prawdopodobieństwem 50% wykonaj rotację Pósy (złam ścieżkę i zrób nowy koniec).
+   c. Destrukcja (Kick): Usuń losowej długości końcówkę ścieżki (najczęściej krótką, rzadziej dłuższą).
+   d. Odbudowa: Zachłannie przedłużaj nowo powstały koniec ścieżki.
+   e. Przeszukiwanie lokalne: Uruchom algorytm poprawy (wymiana wierzchołków) dla zmodyfikowanego fragmentu ścieżki.
+   f. Jeśli nowa ścieżka jest lepsza (cięższa), zapisz ją. W przeciwnym razie przywróć poprzednią (najlepszą) ścieżkę na odrzuconym fragmencie.
+4. Wypisz wynik (rozmiar ścieżki oraz jej wierzchołki).
 
 ```
-+-----------------------------------------------------------+
-| 1. CSR Graph Construction & Sorting                        |
-|    - Contiguous arrays for L1/L2 cache efficiency         |
-|    - Edges sorted in descending order of weight           |
-+-----------------------------+-----------------------------+
-                              |
-+-----------------------------v-----------------------------+
-| 2. Intelligent Starting Node Selection                     |
-|    - BFS tree diameter endpoints                          |
-|    - Degree-1 leaf nodes (natural path endpoints)         |
-|    - Highest weighted-degree hub vertices                 |
-+-----------------------------+-----------------------------+
-                              |
-+-----------------------------v-----------------------------+
-| 3. Multi-Start Construction (First 40% of time)            |
-|    - Bidirectional randomized greedy walk                 |
-|    - Pósa's Endpoint Rotation to escape dead ends         |
-+-----------------------------+-----------------------------+
-                              |
-+-----------------------------v-----------------------------+
-| 4. Iterated Local Search / Perturbation (Next 45% of time)|
-|    - Cut a suffix/prefix of the best path                 |
-|    - Re-extend and re-rotate to discover higher peaks     |
-+-----------------------------+-----------------------------+
-                              |
-+-----------------------------v-----------------------------+
-| 5. Final Fast Walks & Output (Remaining time)              |
-+-----------------------------------------------------------+
-```
 
----
+## 2. Algorytmy i struktury danych
 
-## 3. Data Structures & Memory Optimization (Rule 5)
+### Struktury danych
 
-### Compressed Sparse Row (CSR) Format
-Instead of using `std::vector<std::vector<pair<int,int>>>`, which suffers from memory fragmentation and pointer indirection, we flatten the graph into three contiguous 1D arrays:
-- `adjStart[N + 1]`: `adjStart[u]` points to the beginning index of $u$'s edges, and `adjStart[u + 1]` is the end.
-- `adjTo[2 * M]`: Destination vertex of each directed half-edge.
-- `adjW[2 * M]`: Weight of each directed half-edge.
+1. **Złożona lista sąsiedztwa (`adj`):** Reprezentuje graf. Przechowuje pary `(sąsiad, waga)`. Listy są posortowane w celu szybkiego wyszukiwania, a duplikaty krawędzi są usuwane (zostaje krawędź o maksymalnej wadze).
+2. **Tablica pozycji (`pos`):** Kluczowa struktura dla wydajności algorytmu. Indeksowana numerem wierzchołka, przechowuje jego aktualną pozycję w ścieżce (lub `-1`, jeśli do niej nie należy). Pozwala w czasie $O(1)$ sprawdzać, czy wierzchołek jest już wykorzystany.
+3. **Tablica mapowania krawędzi (`edgeToNext`):** Używana w fazie lokalnego ulepszania. Działa jak szybka mapa (hash map) w czasie $O(1)$ dla sąsiadów konkretnego wierzchołka, co znacząco przyspiesza obliczanie nowych wag krawędzi przy podmienianiu wierzchołków.
+4. **Wektor reprezentujący ścieżkę (`path`):** Przechowuje aktualnie analizowany ciąg wierzchołków.
 
-**Why this is optimal for Optilio:**
-1. **Cache Locality**: Iterating over all neighbors of vertex $u$ is a sequential memory scan from `adjStart[u]` to `adjStart[u+1]`.
-2. **Minimal Memory Overhead**: Uses around $12 \text{ MB}$ total for $5 \cdot 10^5$ edges, fitting entirely inside the CPU's L3 cache.
-3. **Sorted Neighbors**: Each neighbor list is sorted descending by weight $w$. Thus, the first unvisited neighbor is always the best greedy choice.
+### Użyte algorytmy i heurystyki
 
-### $O(1)$ Path State Lookup
-The class/struct `PathState` holds:
-- `vector<int> path`: Array of nodes currently in the path in traversal order.
-- `vector<int> pos`: Lookup table where `pos[v]` is the index of vertex $v$ inside `path`, or `-1` if $v$ is not on the path. This allows checking `isVisited(v)` in $O(1)$ without sets or hash tables.
+1. **Losowy DFS + DP (Dynamic Programming):** Algorytm na początku buduje losowy las DFS, modyfikując wagi krawędzi o tzw. karę za stopień (wierzchołki o wysokim stopniu "kosztują" więcej, by zachować je na później). Następnie za pomocą programowania dynamicznego (DP na drzewach) znajduje w tym lesie najcięższą ścieżkę.
+2. **Rotacje Pósy (Pósa Rotations):** Technika ucieczki ze "ślepych zaułków". Jeśli koniec ścieżki nie ma wolnych sąsiadów, znajdujemy krawędź łączącą koniec ścieżki z jej środkiem. Ścieżka tworzy cykl z "ogonem". Odwracamy odpowiedni fragment cyklu, tworząc nową ścieżkę o tej samej długości, ale z nowym wierzchołkiem końcowym, co często pozwala na dalszą ekspansję.
+3. **Przeszukiwanie lokalne (Local Search / `improve`):**
+* **Wymiana wierzchołków ($a \to c \to b$ na $a \to x \to b$):** Sprawdza, czy można wyrzucić jeden wierzchołek ze środka ścieżki i wstawić inny, nieużywany, jeśli suma wag wzrośnie.
+* **Wstawianie wierzchołków:** Szuka możliwości wsunięcia jednego lub dwóch nowych (nieużywanych) wierzchołków pomiędzy dwa sąsiadujące na ścieżce ($a \to x \to b$ lub $a \to x \to y \to b$).
 
----
 
-## 4. Key Algorithmic Components
 
-### A. Bidirectional Greedy Extension (`extendBothEnds`)
-From the current endpoint $u = \text{path.back()}$:
-1. We inspect $u$'s neighbors in descending weight order.
-2. We identify up to the top 3 unvisited neighbors.
-3. We select among them probabilistically (proportional to $w^2$) to balance greediness with randomized exploration.
-4. When the back end hits a dead end, we reverse the path (`reversePath()`) so the front becomes the back, and extend again.
+## 3. Elementy do udoskonalenia
 
-### B. Pósa's Endpoint Rotation (`tryRotation`)
-A major bottleneck in simple greedy walks is getting trapped in a "dead end", where all neighbors of the current endpoint are already on the path.
+Poniżej znajdują się propozycje optymalizacji, które mogą podnieść punktację algorytmu (jakość rozwiązania) lub liczbę sprawdzanych kombinacji w wyznaczonym czasie, bez psucia jego podstawowej logiki.
 
-Rather than giving up, we apply **Pósa's Rotation** (a classic technique from graph theory for Hamiltonian paths):
+### A. Zrównoleglenie (Wielowątkowość)
 
-```
-Before Rotation:
-  v0 ----> v1 ----> ... ----> vi ----> vi+1 ----> ... ----> vk-1 (endpoint)
-                               ^                              |
-                               +------ Edge (vk-1, vi) -------+
+* **Koncepcja:** Algorytm obecnie korzysta z jednego wątku. Pętla z fazy 2 jest w pełni niezależna od innych równoległych prób (wymagałaby jedynie lokalnych kopii struktur danych). Można uruchomić przeszukiwanie na wielu wątkach i na końcu wybrać globalne maksimum.
+* **Oczekiwany efekt:** Prawie liniowy przyrost liczby iteracji algorytmu w zależności od liczby rdzeni (np. $4\times$ więcej iteracji na 4 rdzeniach). Skutkuje to dużo większą szansą na wyjście z lokalnych maksimów.
+* **Koszt wdrożenia:** Niski/Średni (~1-2 godziny pracy). Użycie `#pragma omp parallel` (OpenMP) lub `std::thread`, plus zhermetyzowanie zmiennych globalnych (jak `path`, `pos`, `curWeight`) wewnątrz klasy/struktury.
 
-After Reversing subsegment [vi+1 ... vk-1]:
-  v0 ----> v1 ----> ... ----> vi ----> vk-1 ----> ... ----> vi+1 (NEW ENDPOINT!)
-```
+### B. Akceptowanie gorszych rozwiązań (Simulated Annealing)
 
-**How it works:**
-1. If the current endpoint $v_{k-1}$ is adjacent to an internal vertex $v_i$ ($i < k - 2$), we add edge $(v_{k-1}, v_i)$ and remove edge $(v_i, v_{i+1})$.
-2. We reverse the subsegment from $i+1$ to $k-1$.
-3. All intermediate edges $(v_r, v_{r-1})$ along the reversed subsegment remain unchanged because the graph is undirected!
-4. The vertex $v_{i+1}$ is now the new endpoint of the path.
-5. If $v_{i+1}$ has unvisited neighbors, the path can **continue growing immediately**!
+* **Koncepcja:** W fazie 2, jeśli odrzucona końcówka i nowo wygenerowana ścieżka dają gorszy wynik (`curWeight < bestWeight`), kod sztywno cofa się do najlepszego rozwiązania (`setPath`). Warto dodać prawdopodobieństwo akceptacji gorszego rozwiązania, malejące wraz z upływem czasu.
+* **Oczekiwany efekt:** Algorytm zyska potężne narzędzie do ucieczki z ekstremów lokalnych. Pozwoli to na eksplorację zupełnie nowych części przestrzeni rozwiązań. Wynikowa waga ścieżki powinna zauważalnie wzrosnąć w grafach o złożonej topologii.
+* **Koszt wdrożenia:** Niski (~1 godzina). Wymaga modyfikacji pętli głównej i dodania wyliczeń funkcji wykładniczej na bazie czasu (`elapsed() / TIME_LIMIT`).
 
-### C. Splicing & Vertex Insertion (`tryInsertions`)
-When path endpoints cannot be expanded further by extensions or rotations:
-1. We iterate over all unvisited vertices $x \notin P$.
-2. For any vertex $x$ that has at least two neighbors on the path, say $u = P[p_1]$ and $v = P[p_2]$ with $p_2 = p_1 + 1$:
-3. We check if replacing edge $(u, v)$ with $(u, x) + (x, v)$ yields $w(u, x) + w(x, v) \ge w(u, v)$.
-4. If so, we insert $x$ between $u$ and $v$. This directly expands path coverage (increasing vertices visited) and score, while enabling future rotations to pivot around $x$.
+### C. Pełna 2-optymalizacja (2-opt dla wag)
 
-### D. Adaptive Failure-Bounded Rotations
-Instead of an arbitrary hard cutoff on rotations (which prematurely stops path growth in graphs with $N \ge 10,000$):
-- We keep rotating and extending as long as progress is being made.
-- We maintain a consecutive failure counter (`failCount`). Only if multiple rotations fail to discover any unvisited vertices does the search terminate and restart.
-- Whenever an extension succeeds, `failCount` is reset to 0.
+* **Koncepcja:** Funkcja `improve` analizuje wstawianie i podmienianie pojedynczych wierzchołków. Brak w niej klasycznego ruchu `2-opt` (usunięcie dwóch nieprzyległych krawędzi i zamienienie ich miejscami przez odwrócenie podścieżki), popularnego w problemach typu TSP.
+* **Oczekiwany efekt:** Wykorzystywanie głębszych zależności. Długie fragmenty ścieżki ułożą się bardziej optymalnie.
+* **Koszt wdrożenia:** Średni/Wysoki (~3-4 godziny). Należy zaimplementować to z rozwagą, aby nie stworzyć wąskiego gardła wydajności (złożoność rzędu $O(L^2)$, gdzie $L$ to długość ścieżki).
 
-### E. Tree Diameter & BFS Initialization (`bfsFarthest`)
-For trees (acyclic graphs) and sparse tree-like components:
-- Rotations are not possible because there are no cycle edges.
-- However, two BFS passes find the exact diameter of a tree in $O(N)$ time.
-- Our solution runs two BFS passes at startup, recording parent pointers, and initializes `bestPath` with the resulting path. On pure trees, this immediately discovers the optimal path.
+### D. Strojenie hiperparametrów (Tuning)
 
-### D. Iterated Local Search (Perturbation)
-In Phase 2, we take the best path found so far and perturb it:
-1. We slice off a random suffix (between 5% and 25% of the path).
-2. We re-extend both ends with randomized choices.
-3. We perform rotation passes to escape local traps.
-4. If a new global best is found, we keep it.
-
----
-
-## 5. Benchmark & Validation Results
-
-We evaluated the solution across diverse graph topologies using our custom test suite and standalone validator (`validate.cpp`):
-
-| Test Case | Graph Type | Vertices ($N$) | Edges ($M$) | Initial Score | Optimized Score | Coverage / Status |
-|:---|:---|:---|:---|:---|:---|:---|
-| `small_random` | Dense Random | 20 | 50 | 1,301 | **1,301** | 19 / 20 (Optimal) |
-| `medium_random`| Random Graph | 1,000 | 5,000 | 66,493 | **77,970** | **1,000 / 1,000 (100% Hamiltonian path)** |
-| `tree` | Tree | 1,000 | 999 | 1,140 | **1,459** | **24 / 24 (100% Optimal diameter)** |
-| `grid` | 2D Grid Lattice | 900 | ~1,740 | 31,141 | **55,404** | **887 / 900 (98.6% coverage)** |
-| `large_random` | Large Random | 10,000 | 50,000 | 546,910 | **727,120** | **9,970 / 10,000 (99.7% coverage)** |
-| `dense` | Very Dense | 500 | 20,000 | 47,458 | **48,596** | **500 / 500 (100% Hamiltonian path)** |
-| `huge_sparse` | Huge Sparse | 50,000 | 100,000 | 454,380 | **1,838,774** | **27,122 / 50,000 (+304% score jump)** |
-
-### Key Takeaways from Benchmarks:
-1. **Grid graphs**: Pósa rotations allowed the path to snake through grid dead ends, jumping from 31k to 55k (+77.7%).
-2. **Huge sparse graphs**: Bidirectional extension combined with rotation allowed discovering paths with over 1.5 million in total edge weight (+235.1%).
-3. **Trees**: Two-pass BFS guarantees finding the theoretical optimal diameter.
-
----
-
-## 6. Project Structure
-
-```
-├── .gitignore          # Ignores binaries, tests/, results/, and temp files
-├── DOCUMENTATION.md    # Full solution documentation
-├── solution.cpp        # Complete Optil.io submission code
-├── gen.cpp             # Graph test instance generator
-├── validate.cpp        # Independent validator verifying path legality & score
-├── test.ps1            # Automated test runner script
-├── tests/              # Generated test instances (test_*.txt)
-└── results/            # Solution outputs for each test (out_*.txt)
-```
-
----
-
-## 7. How to Build and Run
-
-### Compilation
-Compile with C++17 and optimization level `-O2` or `-O3`:
-```bash
-g++ -O2 -std=c++17 -o solution solution.cpp
-```
-
-### Running Locally
-```bash
-./solution < input.txt > output.txt
-```
-
-### Running the Test Suite
-```powershell
-powershell -ExecutionPolicy Bypass -File test.ps1
-```
+* **Koncepcja:** Kod operuje na sztywnych stałych (magiczne liczby: np. prawdopodobieństwa w `rng() % 20`, rzuty typu `rng() % 5000`, parametry kar `penalties = {0, 5, 15, 30}`).
+* **Oczekiwany efekt:** Średnio 2-5% lepsze wyniki na zestawach testowych, jeśli stałe zostaną dobrane przy użyciu algorytmu uczenia maszynowego (np. optymalizacja bayesowska) do konkretnej charakterystyki wejściowych grafów.
+* **Koszt wdrożenia:** Wysoki (tylko pod kątem czasu CPU/testów - wymaga napisania skryptu testującego, np. w Pythonie). Samo zastąpienie magicznych liczb stałymi i wystawienie ich jako argumenty programu zajmie kilka minut.
