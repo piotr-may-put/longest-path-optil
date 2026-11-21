@@ -44,7 +44,7 @@ vector<int> path;              // Current path (sequence of vertices)
 vector<int> pos;               // Position of vertex in path (-1 if not on path)
 vector<int> weightToTarget;    // Scratch array: weight of edge (target, v), 0 if none (used in improve())
 
-mt19937 rng(7);
+mt19937 rng(2137);
 auto startTime = chrono::steady_clock::now();
 
 // ----------------------------------------------------------------------------
@@ -394,23 +394,16 @@ int main() {
     pos.assign(numVertices, -1);
     weightToTarget.assign(numVertices, 0);
  
-    // Read edges (self-loops ignored)
+    // Read edges
     for (int i = 0, u, v, w; i < numEdges; i++) {
         scanf("%d %d %d", &u, &v, &w);
-        if (u != v) {
-            adjacency[u].push_back({v, w});
-            adjacency[v].push_back({u, w});
-        }
+        adjacency[u].push_back({v, w});
+        adjacency[v].push_back({u, w});
     }
  
-    // Remove multi-edges (keep the heaviest) and sort adjacency lists by neighbor id
+    // Sort adjacency lists by neighbor id
     for (auto& neighbors : adjacency) {
-        sort(neighbors.begin(), neighbors.end(), [](const pair<int, int>& x, const pair<int, int>& y) {
-            return x.first != y.first ? x.first < y.first : x.second > y.second;
-        });
-        neighbors.erase(unique(neighbors.begin(), neighbors.end(), [](const pair<int, int>& x, const pair<int, int>& y) {
-            return x.first == y.first;
-        }), neighbors.end());
+        sort(neighbors.begin(), neighbors.end());
     }
  
     vector<int> bestPath = {0};
@@ -438,7 +431,8 @@ int main() {
     // ---- Phase 2: iterated local search (cut the tail, regrow, improve) ----
     setPath(bestPath, bestWeight);
     int iter = 0;
-    while (elapsed() < TIME_LIMIT && ++iter) {
+    while (elapsed() < TIME_LIMIT) {
+        iter++;
         // Randomly work on either end of the path
         if (rng() % 2) {
             flipPath();
