@@ -1,49 +1,86 @@
+// ============================================================================
+// Heuristic search for a heavy simple path in an undirected weighted graph.
+//
+// Input : n m, then m lines "u v w" (0-indexed vertices, edge weight w).
+// Output: number of vertices on the path, then the vertices in order.
+//
+// Overview (see DOCUMENTATION.md for details):
+//   Phase 1 - build many initial paths (DFS-forest diameter + greedy growth
+//             + Posa rotations + local improvement), keep the best.
+//   Phase 2 - iterated local search: cut off a tail of the best path, regrow
+//             it randomly, locally improve, keep the result if not worse.
+// ============================================================================
+ 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <random>
 #include <vector>
 using namespace std;
 
-const double TIME_LIMIT = 29.9;
-const int BUILD_TRIES = 100;
-const int KICK_TRIES = 20;
+// ----------------------------------------------------------------------------
+// PARAMETERS TO BE FINE TUNED
+// ----------------------------------------------------------------------------
+const double TIME_LIMIT = 29.9;                  // total time budget (seconds)
+const double PHASE1_TIME_LIMIT = TIME_LIMIT / 2.75; // end of construction phase
+const double IMPROVE_TIME_LIMIT = TIME_LIMIT / 4;   // no more improve() rounds after this
+const int BUILD_TRIES = 100;                     // rotation attempts in phase 1
+const int KICK_TRIES = 20;                       // rotation attempts in phase 2
 
-int n, m;
-int minDirtyIdx; // Najmniejszy indeks, od którego ścieżka uległa zmianie
-long long curWeight;
+// Penalties for "free degree" used when choosing the next vertex / DFS order.
+const double DEGREE_PENALTIES[] = {0, 5, 15, 30};
+const int NUM_PENALTIES = 4;
 
-vector<vector<pair<int, int>>> adj;
-vector<int> path;
-vector<int> pos;       // Pozycja wierzchołka w ścieżce (-1 jeśli poza ścieżką)
-vector<int> edgeToNext; // Tablica pomocnicza do szybkiego sprawdzania krawędzi w improve()
+// ----------------------------------------------------------------------------
+// Global state
+// ----------------------------------------------------------------------------
+int numVertices, numEdges;
+int minDirtyIdx;        // Smallest path index whose content changed since last sync
+long long curWeight;    // Total weight of the current path
+
+// adjacency[v] = sorted list of (neighbor, weight); no multi-edges
+vector<vector<pair<int, int>>> adjacency;
+vector<int> path;              // Current path (sequence of vertices)
+vector<int> pos;               // Position of vertex in path (-1 if not on path)
+vector<int> weightToTarget;    // Scratch array: weight of edge (target, v), 0 if none (used in improve())
 
 mt19937 rng(7);
 auto startTime = chrono::steady_clock::now();
 
+// ----------------------------------------------------------------------------
+// Utilities
+// ----------------------------------------------------------------------------
+
+// Seconds elapsed since program start.
 double elapsed() {
     return chrono::duration<double>(chrono::steady_clock::now() - startTime).count();
 }
 
+// Weight of edge (a, b) via binary search; 0 if the edge does not exist.
 int getWeight(int a, int b) {
-    auto it = lower_bound(adj[a].begin(), adj[a].end(), b,
-        [](const pair<int, int>& e, int v) { return e.first < v; });
-    return (it != adj[a].end() && it->first == b) ? it->second : 0;
+    auto it = lower_bound(adjacency[a].begin(), adjacency[a].end(), b,
+        [](const pair<int, int>& edge, int v) { return edge.first < v; });
+    return (it != adjacency[a].end() && it->first == b) ? it->second : 0;
 }
 
+// Weight of the path edge between path[i] and path[i+1]; 0 if out of range.
 int pathEdgeWeight(int i) {
     return (i >= 0 && i + 1 < (int)path.size()) ? getWeight(path[i], path[i + 1]) : 0;
 }
 
+// Number of neighbors of u that are not on the path.
 int freeDeg(int u) {
     int deg = 0;
-    for (auto& e : adj[u]) {
-        deg += (pos[e.first] < 0);
+    for (auto& edge : adjacency[u]) {
+        deg += (pos[edge.first] < 0);
     }
     return deg;
 }
 
+// ----------------------------------------------------------------------------
+// Basic path operations (keep `pos` and `curWeight` consistent)
+// ----------------------------------------------------------------------------
+// Append vertex v to the end of the path.
 void pushVertex(int v) {
     if (!path.empty()) {
         curWeight += getWeight(path.back(), v);
@@ -52,6 +89,7 @@ void pushVertex(int v) {
     path.push_back(v);
 }
 
+// Remove and return the last vertex of the path.
 int popVertex() {
     int v = path.back();
     curWeight -= pathEdgeWeight(path.size() - 2);
@@ -60,6 +98,7 @@ int popVertex() {
     return v;
 }
 
+// Reverse path[i..j] (inclusive) and update weight and positions.
 void reverseSubpath(int i, int j) {
     curWeight -= pathEdgeWeight(i - 1) + pathEdgeWeight(j);
     reverse(path.begin() + i, path.begin() + j + 1);
@@ -70,10 +109,13 @@ void reverseSubpath(int i, int j) {
     minDirtyIdx = min(minDirtyIdx, i);
 }
 
+// Reverse the whole path.
 void flipPath() {
     reverseSubpath(0, path.size() - 1);
 }
 
+// Replace the current path by newPath, rewriting only indices >= `from`
+// (the prefix [0, from) is assumed to be identical in both paths).
 void setPath(const vector<int>& newPath, long long newWeight, int from = 0) {
     for (int i = from; i < (int)path.size(); i++) {
         pos[path[i]] = -1;
@@ -85,19 +127,27 @@ void setPath(const vector<int>& newPath, long long newWeight, int from = 0) {
     }
     curWeight = newWeight;
 }
-
-// Zachłanne przedłużanie końca ścieżki z karą za wysoki stopień swobody
+ 
+// ----------------------------------------------------------------------------
+// Path growth
+// ----------------------------------------------------------------------------
+ 
+// Greedily extend the end of the path. Each candidate neighbor is scored by
+// edge weight, penalized by its free degree (and heavily if it would be a
+// dead end), plus a small random noise.
 void grow(double degPenalty) {
     for (;;) {
         int bestNext = -1;
         double bestScore = -1e18;
-        for (auto& e : adj[path.back()]) {
-            if (pos[e.first] < 0) {
-                int u = e.first, w = e.second, d = freeDeg(u);
-                double score = w - degPenalty * d - (d == 0) * 1000 + rng() % 20;
+        for (auto& edge : adjacency[path.back()]) {
+            if (pos[edge.first] < 0) {
+                int candidate = edge.first, weight = edge.second;
+                int freeDegree = freeDeg(candidate);
+                double score = weight - degPenalty * freeDegree
+                               - (freeDegree == 0) * 1000 + rng() % 20;
                 if (score > bestScore) {
                     bestScore = score;
-                    bestNext = u;
+                    bestNext = candidate;
                 }
             }
         }
@@ -105,13 +155,15 @@ void grow(double degPenalty) {
         pushVertex(bestNext);
     }
 }
-
-// Rotacja Pósy odwracająca sufiks ścieżki, aby odblokować możliwość dalszego wzrostu
+ 
+// Posa rotation: reverse a suffix of the path so that a different vertex
+// becomes the endpoint, which may allow further growth.
+// Prefers rotations whose new endpoint still has free neighbors.
 bool rotateEnd() {
     int last = path.size() - 1;
     vector<int> goodCandidates, allCandidates;
-    for (auto& e : adj[path[last]]) {
-        int i = pos[e.first];
+    for (auto& edge : adjacency[path[last]]) {
+        int i = pos[edge.first];
         if (i < 0 || i >= last - 1) continue;
         allCandidates.push_back(i);
         if (freeDeg(path[i + 1]) > 0) {
@@ -120,20 +172,23 @@ bool rotateEnd() {
     }
     vector<int>& candidates = goodCandidates.empty() ? allCandidates : goodCandidates;
     if (candidates.empty()) return false;
-
+ 
     int splitIdx = candidates[rng() % candidates.size()];
     reverseSubpath(splitIdx + 1, last);
     return true;
 }
-
+ 
+// Grow the path end, alternating rotations and greedy growth.
+// The try counter resets whenever a new longest length is reached.
 void growEnd(double degPenalty, int maxTries) {
     grow(degPenalty);
     for (int t = 0, maxLen = path.size(); t < maxTries && elapsed() < TIME_LIMIT; t++) {
         if (!rotateEnd()) {
             if (path.size() == 1) return;
-            int v = popVertex();
+            // Try dropping the last vertex and rotating again
+            int removed = popVertex();
             if (!rotateEnd()) {
-                pushVertex(v);
+                pushVertex(removed);
                 return;
             }
         }
@@ -144,88 +199,9 @@ void growEnd(double degPenalty, int maxTries) {
         }
     }
 }
-
-// Lokalna poprawa ścieżki: podmiana pojedynczych wierzchołków oraz wstawianie 1-2 nowych
-bool improve(int from) {
-    bool improved = false;
-    int len = path.size();
-
-    // 1. Podmiana wierzchołka: a -> c -> b na a -> x -> b
-    for (int i = max(from, 1); i + 1 < len; i++) {
-        int a = path[i - 1], c = path[i], b = path[i + 1];
-        int oldW = getWeight(a, c) + getWeight(c, b);
-        int bestW = oldW, bestX = -1;
-
-        for (auto& e : adj[b]) edgeToNext[e.first] = e.second;
-        for (auto& e : adj[a]) {
-            int x = e.first, w = e.second;
-            if (pos[x] < 0 && edgeToNext[x] && w + edgeToNext[x] > bestW) {
-                bestW = w + edgeToNext[x];
-                bestX = x;
-            }
-        }
-        for (auto& e : adj[b]) edgeToNext[e.first] = 0;
-
-        if (bestX >= 0) {
-            pos[c] = -1;
-            pos[bestX] = i;
-            path[i] = bestX;
-            curWeight += bestW - oldW;
-            improved = true;
-        }
-    }
-
-    // 2. Wstawianie 1 lub 2 wolnych wierzchołków pomiędzy sąsiednie a -> b
-    vector<int> newPath(path.begin(), path.begin() + from);
-    for (int i = from; i < len; i++) {
-        int a = path[i];
-        newPath.push_back(a);
-        if (i + 1 == len) break;
-
-        int b = path[i + 1];
-        int oldW = getWeight(a, b);
-        int bestW = oldW, bestX = -1, bestY = -1;
-
-        for (auto& e : adj[b]) edgeToNext[e.first] = e.second;
-        for (auto& e : adj[a]) {
-            if (pos[e.first] < 0) {
-                int x = e.first, wx = e.second;
-                if (edgeToNext[x] && wx + edgeToNext[x] > bestW) {
-                    bestW = wx + edgeToNext[x];
-                    bestX = x;
-                    bestY = -1;
-                }
-                for (auto& f : adj[x]) {
-                    int y = f.first, wy = f.second;
-                    if (pos[y] < 0 && edgeToNext[y] && wx + wy + edgeToNext[y] > bestW) {
-                        bestW = wx + wy + edgeToNext[y];
-                        bestX = x;
-                        bestY = y;
-                    }
-                }
-            }
-        }
-        for (auto& e : adj[b]) edgeToNext[e.first] = 0;
-
-        if (bestX >= 0) {
-            newPath.push_back(bestX);
-            pos[bestX] = 0;
-            curWeight += bestW - oldW;
-            improved = true;
-            if (bestY >= 0) {
-                newPath.push_back(bestY);
-                pos[bestY] = 0;
-            }
-        }
-    }
-
-    path = newPath;
-    for (int i = from; i < (int)path.size(); i++) {
-        pos[path[i]] = i;
-    }
-    return improved;
-}
-
+ 
+// Extend one end, flip the path, extend the other end; stop after two
+// consecutive passes without any progress.
 void extendBothEnds(double degPenalty, int maxTries) {
     for (int stuck = 0; stuck < 2;) {
         int prevLen = path.size();
@@ -234,93 +210,201 @@ void extendBothEnds(double degPenalty, int maxTries) {
         stuck = ((int)path.size() > prevLen) ? 0 : stuck + 1;
     }
 }
-
-// Budowa lasu DFS i znalezienie w nim najcięższej ścieżki (średnicy drzewa)
-vector<int> dfsPath(double degPenalty) {
-    vector<int> parent(n, -1), parentWeight(n, 0), headIdx(n, 0), seen(n, 0);
-    vector<int> bestChild1(n, -1), bestChild2(n, -1), order, stack, roots(n);
-    vector<long long> maxDown1(n, 0), maxDown2(n, 0);
-    vector<vector<pair<int, int>>> sortedAdj(n);
-
-    for (int v = 0; v < n; v++) {
-        for (auto& e : adj[v]) {
-            int priority = -(int)(e.second - degPenalty * adj[e.first].size() + rng() % 20);
-            sortedAdj[v].push_back({priority, e.first});
+ 
+// ----------------------------------------------------------------------------
+// Local improvement
+// ----------------------------------------------------------------------------
+ 
+// Local improvement of the path from index `from` onward:
+//   1. Replace a single vertex:  a -> c -> b   becomes   a -> x -> b
+//   2. Insert 1 or 2 free vertices between consecutive vertices a -> b.
+// Returns true if anything improved.
+bool improve(int from) {
+    bool improved = false;
+    int len = path.size();
+ 
+    // --- 1. Vertex substitution ---
+    for (int i = max(from, 1); i + 1 < len; i++) {
+        int prev = path[i - 1], current = path[i], next = path[i + 1];
+        int oldWeight = getWeight(prev, current) + getWeight(current, next);
+        int bestWeight = oldWeight, bestX = -1;
+ 
+        // Mark weights of edges into `next` for O(1) lookup
+        for (auto& edge : adjacency[next]) weightToTarget[edge.first] = edge.second;
+        for (auto& edge : adjacency[prev]) {
+            int x = edge.first, weight = edge.second;
+            if (pos[x] < 0 && weightToTarget[x] && weight + weightToTarget[x] > bestWeight) {
+                bestWeight = weight + weightToTarget[x];
+                bestX = x;
+            }
         }
-        sort(sortedAdj[v].begin(), sortedAdj[v].end());
+        for (auto& edge : adjacency[next]) weightToTarget[edge.first] = 0;
+ 
+        if (bestX >= 0) {
+            pos[current] = -1;
+            pos[bestX] = i;
+            path[i] = bestX;
+            curWeight += bestWeight - oldWeight;
+            improved = true;
+        }
     }
-
-    for (int v = 0; v < n; v++) roots[v] = v;
-    shuffle(roots.begin(), roots.end(), rng);
-
-    for (int r : roots) {
-        if (!seen[r]) {
-            seen[r] = 1;
-            order.push_back(r);
-            stack.push_back(r);
-            while (!stack.empty()) {
-                int v = stack.back();
-                if (headIdx[v] == (int)sortedAdj[v].size()) {
-                    stack.pop_back();
-                    continue;
+ 
+    // --- 2. Insertion of 1 or 2 free vertices (builds a new path) ---
+    vector<int> newPath(path.begin(), path.begin() + from);
+    for (int i = from; i < len; i++) {
+        int a = path[i];
+        newPath.push_back(a);
+        if (i + 1 == len) break;
+ 
+        int b = path[i + 1];
+        int oldWeight = getWeight(a, b);
+        int bestWeight = oldWeight, bestX = -1, bestY = -1;
+ 
+        for (auto& edge : adjacency[b]) weightToTarget[edge.first] = edge.second;
+        for (auto& edgeA : adjacency[a]) {
+            if (pos[edgeA.first] < 0) {
+                int x = edgeA.first, weightAX = edgeA.second;
+                // Insert a single vertex: a -> x -> b
+                if (weightToTarget[x] && weightAX + weightToTarget[x] > bestWeight) {
+                    bestWeight = weightAX + weightToTarget[x];
+                    bestX = x;
+                    bestY = -1;
                 }
-                int u = sortedAdj[v][headIdx[v]++].second;
-                if (seen[u]) continue;
-                seen[u] = 1;
-                parent[u] = v;
-                parentWeight[u] = getWeight(v, u);
-                order.push_back(u);
-                stack.push_back(u);
+                // Insert two vertices: a -> x -> y -> b
+                for (auto& edgeX : adjacency[x]) {
+                    int y = edgeX.first, weightXY = edgeX.second;
+                    if (pos[y] < 0 && weightToTarget[y]
+                        && weightAX + weightXY + weightToTarget[y] > bestWeight) {
+                        bestWeight = weightAX + weightXY + weightToTarget[y];
+                        bestX = x;
+                        bestY = y;
+                    }
+                }
+            }
+        }
+        for (auto& edge : adjacency[b]) weightToTarget[edge.first] = 0;
+ 
+        if (bestX >= 0) {
+            newPath.push_back(bestX);
+            pos[bestX] = 0; // temporary "used" marker; real positions set below
+            curWeight += bestWeight - oldWeight;
+            improved = true;
+            if (bestY >= 0) {
+                newPath.push_back(bestY);
+                pos[bestY] = 0;
             }
         }
     }
-
-    // Programowanie dynamiczne na drzewie DFS (dwie najdłuższe gałęzie w dół z każdego u)
-    for (int i = n - 1; i >= 0; i--) {
-        int v = order[i], u = parent[v];
-        if (u < 0) continue;
-        long long d = maxDown1[v] + parentWeight[v];
-        if (d > maxDown1[u]) {
-            maxDown2[u] = maxDown1[u];
-            bestChild2[u] = bestChild1[u];
-            maxDown1[u] = d;
-            bestChild1[u] = v;
-        } else if (d > maxDown2[u]) {
-            maxDown2[u] = d;
-            bestChild2[u] = v;
-        }
+ 
+    path = newPath;
+    for (int i = from; i < (int)path.size(); i++) {
+        pos[path[i]] = i;
     }
-
-    int bestLca = 0;
-    for (int x = 0; x < n; x++) {
-        if (maxDown1[x] + maxDown2[x] > maxDown1[bestLca] + maxDown2[bestLca]) {
-            bestLca = x;
-        }
-    }
-
-    vector<int> res;
-    for (int x = bestChild2[bestLca]; x >= 0; x = bestChild1[x]) res.push_back(x);
-    reverse(res.begin(), res.end());
-    for (int x = bestLca; x >= 0; x = bestChild1[x]) res.push_back(x);
-    return res;
+    return improved;
 }
-
+ 
+// ----------------------------------------------------------------------------
+// Initial path construction
+// ----------------------------------------------------------------------------
+ 
+// Build a DFS forest (neighbors ordered by weight minus degree penalty plus
+// noise, random roots) and return the heaviest path inside it (tree diameter).
+vector<int> dfsPath(double degPenalty) {
+    vector<int> parent(numVertices, -1), parentWeight(numVertices, 0);
+    vector<int> nextNeighborIdx(numVertices, 0), visited(numVertices, 0);
+    vector<int> bestChild(numVertices, -1), secondChild(numVertices, -1);
+    vector<int> visitOrder, dfsStack, roots(numVertices);
+    vector<long long> bestDown(numVertices, 0), secondDown(numVertices, 0);
+    // sortedAdj[v] = (priority, neighbor), ascending priority = visited first
+    vector<vector<pair<int, int>>> sortedAdj(numVertices);
+ 
+    for (int v = 0; v < numVertices; v++) {
+        for (auto& edge : adjacency[v]) {
+            int priority = -(int)(edge.second - degPenalty * adjacency[edge.first].size() + rng() % 20);
+            sortedAdj[v].push_back({priority, edge.first});
+        }
+        sort(sortedAdj[v].begin(), sortedAdj[v].end());
+    }
+ 
+    for (int v = 0; v < numVertices; v++) roots[v] = v;
+    shuffle(roots.begin(), roots.end(), rng);
+ 
+    // Iterative DFS over all components
+    for (int root : roots) {
+        if (!visited[root]) {
+            visited[root] = 1;
+            visitOrder.push_back(root);
+            dfsStack.push_back(root);
+            while (!dfsStack.empty()) {
+                int v = dfsStack.back();
+                if (nextNeighborIdx[v] == (int)sortedAdj[v].size()) {
+                    dfsStack.pop_back();
+                    continue;
+                }
+                int u = sortedAdj[v][nextNeighborIdx[v]++].second;
+                if (visited[u]) continue;
+                visited[u] = 1;
+                parent[u] = v;
+                parentWeight[u] = getWeight(v, u);
+                visitOrder.push_back(u);
+                dfsStack.push_back(u);
+            }
+        }
+    }
+ 
+    // Tree DP (children before parents): for each vertex keep the two heaviest
+    // downward branches.
+    for (int i = numVertices - 1; i >= 0; i--) {
+        int v = visitOrder[i], u = parent[v];
+        if (u < 0) continue;
+        long long down = bestDown[v] + parentWeight[v];
+        if (down > bestDown[u]) {
+            secondDown[u] = bestDown[u];
+            secondChild[u] = bestChild[u];
+            bestDown[u] = down;
+            bestChild[u] = v;
+        } else if (down > secondDown[u]) {
+            secondDown[u] = down;
+            secondChild[u] = v;
+        }
+    }
+ 
+    // Vertex where two heaviest branches combine into the heaviest path
+    int bestTop = 0;
+    for (int x = 0; x < numVertices; x++) {
+        if (bestDown[x] + secondDown[x] > bestDown[bestTop] + secondDown[bestTop]) {
+            bestTop = x;
+        }
+    }
+ 
+    // Reconstruct: second branch (reversed), then top, then best branch
+    vector<int> result;
+    for (int x = secondChild[bestTop]; x >= 0; x = bestChild[x]) result.push_back(x);
+    reverse(result.begin(), result.end());
+    for (int x = bestTop; x >= 0; x = bestChild[x]) result.push_back(x);
+    return result;
+}
+ 
+// ----------------------------------------------------------------------------
+// Main
+// ----------------------------------------------------------------------------
 int main() {
-    scanf("%d %d", &n, &m);
-    adj.resize(n);
-    pos.assign(n, -1);
-    edgeToNext.assign(n, 0);
-
-    for (int i = 0, u, v, w; i < m; i++) {
+    scanf("%d %d", &numVertices, &numEdges);
+    adjacency.resize(numVertices);
+    pos.assign(numVertices, -1);
+    weightToTarget.assign(numVertices, 0);
+ 
+    // Read edges (self-loops ignored)
+    for (int i = 0, u, v, w; i < numEdges; i++) {
         scanf("%d %d %d", &u, &v, &w);
         if (u != v) {
-            adj[u].push_back({v, w});
-            adj[v].push_back({u, w});
+            adjacency[u].push_back({v, w});
+            adjacency[v].push_back({u, w});
         }
     }
-
-    // Usunięcie krawędzi wielokrotnych (zostaje najcięższa) i posortowanie list sąsiedztwa
-    for (auto& neighbors : adj) {
+ 
+    // Remove multi-edges (keep the heaviest) and sort adjacency lists by neighbor id
+    for (auto& neighbors : adjacency) {
         sort(neighbors.begin(), neighbors.end(), [](const pair<int, int>& x, const pair<int, int>& y) {
             return x.first != y.first ? x.first < y.first : x.second > y.second;
         });
@@ -328,22 +412,21 @@ int main() {
             return x.first == y.first;
         }), neighbors.end());
     }
-
-    double penalties[] = {0, 5, 15, 30};
+ 
     vector<int> bestPath = {0};
     long long bestWeight = 0;
-
-    // Faza 1: Konstrukcja początkowych ścieżek i wybór najlepszej
-    for (int t = 0;  elapsed() < TIME_LIMIT / 2.75; t++) {
-        double penalty = penalties[t % 4];
+ 
+    // ---- Phase 1: construct initial paths and keep the best ----
+    for (int t = 0; elapsed() < PHASE1_TIME_LIMIT; t++) {
+        double penalty = DEGREE_PENALTIES[t % NUM_PENALTIES];
         vector<int> initPath = dfsPath(penalty);
-        long long w = 0;
+        long long initWeight = 0;
         for (int i = 0; i + 1 < (int)initPath.size(); i++) {
-            w += getWeight(initPath[i], initPath[i + 1]);
+            initWeight += getWeight(initPath[i], initPath[i + 1]);
         }
-        setPath(initPath, w);
+        setPath(initPath, initWeight);
         extendBothEnds(penalty, BUILD_TRIES);
-        for (int r = 0; r < 5 && improve(0) && elapsed() < TIME_LIMIT / 4; r++) {
+        for (int round = 0; round < 5 && improve(0) && elapsed() < IMPROVE_TIME_LIMIT; round++) {
             extendBothEnds(penalty, BUILD_TRIES);
         }
         if (curWeight > bestWeight) {
@@ -351,11 +434,12 @@ int main() {
             bestPath = path;
         }
     }
-
-    // Faza 2: Iteracyjne przeszukiwanie lokalne (częściowe cofanie i odbudowa ścieżki)
+ 
+    // ---- Phase 2: iterated local search (cut the tail, regrow, improve) ----
     setPath(bestPath, bestWeight);
     int iter = 0;
     while (elapsed() < TIME_LIMIT && ++iter) {
+        // Randomly work on either end of the path
         if (rng() % 2) {
             flipPath();
             reverse(bestPath.begin(), bestPath.end());
@@ -364,25 +448,30 @@ int main() {
         if (rng() % 2) {
             rotateEnd();
         }
-
+ 
+        // Choose how much of the path to keep: usually cut a short tail
+        // (up to 100 vertices), occasionally (1 in 20) a long one (up to 5000).
         int keepIdx = max(0, (int)path.size() - 2 - (int)(rng() % (rng() % 20 ? 100 : 5000)));
+        // Make sure the new endpoint still has a free neighbor
         while (keepIdx > 0 && freeDeg(path[keepIdx]) == 0) {
             keepIdx--;
         }
         while ((int)path.size() > keepIdx + 1) {
             popVertex();
         }
-
+ 
         minDirtyIdx = min(minDirtyIdx, keepIdx + 1);
-        growEnd(penalties[rng() % 4], KICK_TRIES);
-
+        growEnd(DEGREE_PENALTIES[rng() % NUM_PENALTIES], KICK_TRIES);
+ 
+        // Full improvement every 100 iterations, otherwise only the changed region
         if (iter % 100 == 0) {
             minDirtyIdx = 0;
             improve(0);
         } else {
             improve(max(max(minDirtyIdx - 2, (int)path.size() - 1000), 0));
         }
-
+ 
+        // Accept if not worse (copy only the changed suffix), else roll back
         int syncFrom = max(minDirtyIdx - 3, 0);
         if (curWeight >= bestWeight) {
             bestWeight = curWeight;
@@ -392,7 +481,8 @@ int main() {
             setPath(bestPath, bestWeight, syncFrom);
         }
     }
-
+ 
+    // Output
     printf("%d\n", (int)bestPath.size());
     for (int v : bestPath) printf("%d ", v);
     printf("\n");
